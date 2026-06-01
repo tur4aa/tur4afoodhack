@@ -5,6 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    base: '/tur4afoodhack/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

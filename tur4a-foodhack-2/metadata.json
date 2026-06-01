@@ -1,0 +1,8 @@
+{
+  "name": "tur4a FoodHack",
+  "description": "Дневник питания с автоматическим подсчетом калорий, белков, жиров и углеводов по дням.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

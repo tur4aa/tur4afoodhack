@@ -1,0 +1,80 @@
+{
+  "entities": {
+    "foodItem": {
+      "title": "FoodItem",
+      "description": "Item of food logged by the user with its KBJU values",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique identifier of the food item" },
+        "name": { "type": "string", "description": "Name of the food" },
+        "kcal": { "type": "number", "description": "Calories of the portion" },
+        "protein": { "type": "number", "description": "Proteins of the portion" },
+        "fat": { "type": "number", "description": "Fats of the portion" },
+        "carb": { "type": "number", "description": "Carbohydrates of the portion" },
+        "weight": { "type": "number", "description": "Weight of the portion in grams" },
+        "unit": { "type": "string", "description": "Portion unit (e.g., g, pcs)" },
+        "portionSize": { "type": "number", "description": "The size or multiplier of the portion" }
+      },
+      "required": ["id", "name", "kcal", "protein", "fat", "carb", "weight"]
+    },
+    "dayData": {
+      "title": "DayData",
+      "description": "Holds the breakfast, lunch, dinner, and snack food items logged for a single day",
+      "type": "object",
+      "properties": {
+        "breakfast": {
+          "type": "array",
+          "description": "Breakfast logged food items"
+        },
+        "lunch": {
+          "type": "array",
+          "description": "Lunch logged food items"
+        },
+        "dinner": {
+          "type": "array",
+          "description": "Dinner logged food items"
+        },
+        "snack": {
+          "type": "array",
+          "description": "Snacks logged food items"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the day data was last synced"
+        }
+      },
+      "required": ["breakfast", "lunch", "dinner", "snack"]
+    },
+    "foodTemplate": {
+      "title": "FoodTemplate",
+      "description": "Custom food templates created or modified by the user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique template identifier" },
+        "name": { "type": "string", "description": "Name of the template food" },
+        "kcal": { "type": "number", "description": "Calories per 100g or per unit" },
+        "protein": { "type": "number", "description": "Proteins per 100g or per unit" },
+        "fat": { "type": "number", "description": "Fats per 100g or per unit" },
+        "carb": { "type": "number", "description": "Carbohydrates per 100g or per unit" },
+        "usageCount": { "type": "number", "description": "How many times this template has been used" },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of the last modification"
+        }
+      },
+      "required": ["id", "name", "kcal", "protein", "fat", "carb", "usageCount"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/days/{date}": {
+      "schema": "dayData",
+      "description": "User's log for a specific date (e.g., 2026-06-01)"
+    },
+    "/users/{userId}/templates/{templateId}": {
+      "schema": "foodTemplate",
+      "description": "User's customized food templates"
+    }
+  }
+}

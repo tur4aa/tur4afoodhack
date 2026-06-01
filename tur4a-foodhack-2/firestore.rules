@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default catch-all: DENY ALL
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
+    }
+
+    function isValidDate(date) {
+      return date is string && date.size() <= 32 && date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function isNumeric(val) {
+      return val is int || val is float;
+    }
+
+    // Validation helper for FoodItem mapping
+    function isValidFoodItem(item) {
+      return item is map &&
+             item.id is string && item.id.size() <= 128 &&
+             item.name is string && item.name.size() <= 150 &&
+             isNumeric(item.kcal) && item.kcal >= -0.01 && item.kcal <= 10000 &&
+             isNumeric(item.protein) && item.protein >= -0.01 && item.protein <= 1000 &&
+             isNumeric(item.fat) && item.fat >= -0.01 && item.fat <= 1000 &&
+             isNumeric(item.carb) && item.carb >= -0.01 && item.carb <= 1000 &&
+             (!('weight' in item) || (isNumeric(item.weight) && item.weight >= 0 && item.weight <= 20000)) &&
+             (!('portionSize' in item) || (isNumeric(item.portionSize) && item.portionSize >= 0)) &&
+             (!('unit' in item) || (item.unit is string && item.unit.size() <= 32));
+    }
+
+    // Validation helper for Food meal arrays
+    function isValidMealList(meals) {
+      return meals is list &&
+             meals.size() <= 200 &&
+             (meals.size() == 0 || isValidFoodItem(meals[0])); // Verify structural safety of head
+    }
+
+    // Validation helper for Day entry
+    function isValidDay(data) {
+      return data.keys().hasAll(['breakfast', 'lunch', 'dinner', 'snack']) &&
+             isValidMealList(data.breakfast) &&
+             isValidMealList(data.lunch) &&
+             isValidMealList(data.dinner) &&
+             isValidMealList(data.snack) &&
+             (!('updatedAt' in data) || data.updatedAt == request.time);
+    }
+
+    // Validation helper for User templates
+    function isValidTemplate(data) {
+      return data.keys().hasAll(['id', 'name', 'kcal', 'protein', 'fat', 'carb', 'usageCount']) &&
+             data.id is string && data.id.size() <= 128 &&
+             data.name is string && data.name.size() <= 150 &&
+             isNumeric(data.kcal) && data.kcal >= 0 && data.kcal <= 10000 &&
+             isNumeric(data.protein) && data.protein >= 0 && data.protein <= 1000 &&
+             isNumeric(data.fat) && data.fat >= 0 && data.fat <= 1000 &&
+             isNumeric(data.carb) && data.carb >= 0 && data.carb <= 1000 &&
+             isNumeric(data.usageCount) && data.usageCount >= 0 &&
+             (!('updatedAt' in data) || data.updatedAt == request.time);
+    }
+
+    // User Subcollections Match Block
+    match /users/{userId} {
+      
+      // Daily menu log entries
+      match /days/{date} {
+        allow get, list: if isOwner(userId);
+        
+        allow create: if isOwner(userId) && 
+                         isValidDate(date) && 
+                         isValidDay(incoming());
+                         
+        allow update: if isOwner(userId) && 
+                         isValidDate(date) && 
+                         isValidDay(incoming());
+                         
+        allow delete: if isOwner(userId);
+      }
+
+      // Food templates customized by user
+      match /templates/{templateId} {
+        allow get, list: if isOwner(userId);
+        
+        allow create: if isOwner(userId) && 
+                         isValidId(templateId) && 
+                         isValidTemplate(incoming());
+                         
+        allow update: if isOwner(userId) && 
+                         isValidId(templateId) && 
+                         isValidTemplate(incoming());
+                         
+        allow delete: if isOwner(userId);
+      }
+
+      // User settings / goals preferences
+      match /settings/{settingId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+  }
+}

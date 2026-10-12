@@ -1,0 +1,16 @@
+# Linux (systemd): /etc/systemd/system/personal-os-bot.service
+# Замените USER и путь /home/USER/personal-os-bot.
+[Unit]
+Description=Personal OS Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=USER
+WorkingDirectory=/home/USER/personal-os-bot
+ExecStart=/home/USER/personal-os-bot/.venv/bin/python -m bot
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,11 +1,13 @@
 """Stage 2: recurring reminders/payments, calendar, inbox, digests, payday budget, access control."""
 import asyncio
+
+from tests.conftest import plain
 from datetime import datetime
 from types import SimpleNamespace
 
 
 def bells(svc):
-    return [n for n in svc.collect_due() if n.reply.text.startswith("🔔")]
+    return [n for n in svc.collect_due() if plain(n.reply.text).startswith("🔔")]
 
 
 def test_monthly_reminder_for_bills(svc, mid, clock):
@@ -18,7 +20,7 @@ def test_monthly_reminder_for_bills(svc, mid, clock):
     n.on_sent()
     rem = svc.db.one("SELECT * FROM reminders")
     assert rem["status"] == "active" and rem["remind_at"] == "2026-12-01 05:00:00" and rem["pending_ack"] == 1
-    assert "Ждут ответа" in svc.view_today().text
+    assert "Ждут ответа" in plain(svc.view_today().text)
     svc.handle_callback(f"r:d:{rem['id']}")
     assert svc.db.scalar("SELECT pending_ack FROM reminders") == 0
 
@@ -75,7 +77,7 @@ def test_inbox_list_and_conversions(svc, mid):
     svc.process_text("подарок маме 150", mid())  # money signal -> expense directly
     svc.process_text("непонятная штука", mid())
     v = svc.view_inbox()
-    assert v.text.startswith("📥 Inbox (2)")
+    assert plain(v.text).startswith("📥 Inbox (2)")
     first, second = [r["id"] for r in svc.db.all("SELECT id FROM inbox ORDER BY id")]
     r = svc.handle_callback(f"ib:{first}:x")
     assert "непонятная штука" in r.text  # shows the next item
@@ -83,7 +85,7 @@ def test_inbox_list_and_conversions(svc, mid):
     assert "Какая сумма" in r.text
     r = svc.process_text("45", mid())
     assert "−45 AED" in r.text
-    assert svc.view_inbox().text == "📥 Inbox пуст."
+    assert plain(svc.view_inbox().text) == "📥 Inbox пуст."
 
 
 def test_inbox_to_task(svc, mid):
@@ -100,14 +102,14 @@ def test_morning_and_evening_digests(svc, mid, clock):
     assert svc.collect_due() == []
     clock.set_local(datetime(2026, 10, 12, 8, 0, 20))
     [n] = svc.collect_due()
-    assert n.reply.text.startswith("☀️ Доброе утро!")
-    assert "Купить продукты" in n.reply.text and "12:00 Встреча с куратором" in n.reply.text
+    assert plain(n.reply.text).startswith("☀️ Доброе утро!")
+    assert "Купить продукты" in plain(n.reply.text) and "12:00 Встреча с куратором" in plain(n.reply.text)
     n.on_sent()
     assert svc.collect_due() == []  # once per day
     clock.set_local(datetime(2026, 10, 12, 21, 30, 10))
-    [ev] = [n for n in svc.collect_due() if n.reply.text.startswith("🌙")]
-    assert "Расходов сегодня не записано" in ev.reply.text  # does not assume zero spending
-    assert "Не сделано: 1" in ev.reply.text
+    [ev] = [n for n in svc.collect_due() if plain(n.reply.text).startswith("🌙")]
+    assert "Расходов сегодня не записано" in plain(ev.reply.text)  # does not assume zero spending
+    assert "Не сделано: 1" in plain(ev.reply.text)
     cb = ev.reply.buttons[0][0][1]
     svc.handle_callback(cb)
     assert svc.db.scalar("SELECT due_date FROM tasks") == "2026-10-13"
@@ -121,7 +123,7 @@ def test_digest_can_be_disabled(svc, clock):
 
 def test_missed_digest_is_not_sent_late(svc, clock):
     clock.set_local(datetime(2026, 10, 12, 15, 0))  # laptop was asleep all morning
-    assert not [n for n in svc.collect_due() if n.reply.text.startswith("☀️")]
+    assert not [n for n in svc.collect_due() if plain(n.reply.text).startswith("☀️")]
 
 
 def test_payday_budget(svc, mid):

@@ -78,6 +78,7 @@ class Service(CapitalMixin):
         self.clock = clock  # naive UTC
         self.ai = ai        # optional ai.AIClient; None = rules only
         self.market = Market(db, fetch or http_get)
+        self.webapp_on = False   # set by the Telegram layer when WEBAPP_URL is configured
         self._fx_missing: set[str] = set()
         with db.tx():
             for k, v in DEFAULTS.items():
@@ -336,7 +337,12 @@ class Service(CapitalMixin):
                     continue
                 title = fmt.cap(it.title)
                 t = time(*it.time) if it.time else None
-                if it.type == "note":
+                if it.type == "capital":
+                    ci = capital.parse(it.title, self.currency, [a["name"] for a in self._accounts()])
+                    if ci is None:
+                        raise ValueError(f"AI capital phrase not understood: {it.title!r}")
+                    replies.append(self._h_capital(ci, msg_id))
+                elif it.type == "note":
                     replies.append(self._h_note(Intent("note", title=title), msg_id))
                 elif it.recurrence:
                     ti = TimeInfo(date=it.date, time=t, recurrence=it.recurrence,
@@ -359,7 +365,7 @@ class Service(CapitalMixin):
                     replies.append(self._create_task(title, d, local, it.deadline, msg_id))
             ids = [r["id"] for r in self.db.all("SELECT id FROM actions WHERE id > ? ORDER BY id", (before,))]
             aid = self._merge_actions(ids, "разбор AI")
-        lines = [r.text for r in replies]
+        lines = [r.text if r.html else html.escape(r.text) for r in replies]
         buttons: Buttons = []
         if aid:
             buttons.append([("Отменить всё", f"u:{aid}")])
@@ -368,7 +374,7 @@ class Service(CapitalMixin):
             buttons[0].append(("Изменить", tx_buttons[0][1]))
         elif tx_buttons:
             buttons.append(tx_buttons[:8])
-        return Reply("🤖 " + "\n".join(lines), buttons)
+        return Reply("🤖 " + "\n".join(lines), buttons, html=True)
 
     def _merge_actions(self, ids: list[int], description: str) -> int | None:
         """Fold several actions into one, so a single "Отменить" reverts them all."""
@@ -1115,7 +1121,7 @@ class Service(CapitalMixin):
                     return Reply("Неизвестная настройка.")
         except (ValueError, ArithmeticError):
             return Reply("Не понял значение. Попробуйте ещё раз или напишите «отмена».")
-        return Reply(f"Сохранено ✅\n\n{self.settings_text()}", self.settings_buttons())
+        return Reply("Сохранено ✅\n\n" + self._as_html(self.settings_text()), self.settings_buttons(), html=True)
 
     @staticmethod
     def _num(v: str) -> str:
@@ -1432,6 +1438,20 @@ class Service(CapitalMixin):
         n = self._payday_numbers()
         return None if n is None else n["per_day"]
 
+    @staticmethod
+    def _as_html(text: str) -> str:
+        """Escape everything, then bold the title line and section headers ("Задачи:" -> <b>Задачи</b>)."""
+        out = []
+        for i, line in enumerate(text.split("\n")):
+            esc = html.escape(line)
+            stripped = line.strip()
+            if i == 0 and stripped:
+                esc = f"<b>{esc}</b>"
+            elif stripped.endswith(":") and len(stripped) <= 40 and not stripped.startswith(("•", "-")):
+                esc = esc.replace(html.escape(stripped), f"<b>{html.escape(stripped[:-1])}</b>")
+            out.append(esc)
+        return "\n".join(out)
+
     # ------------------------------------------------------------ views
     def view_today(self) -> Reply:
         today, now = self.today(), self.now_local()
@@ -1471,7 +1491,7 @@ class Service(CapitalMixin):
         lines.append(money_line)
         buttons = [[(f"✅ {fmt.short(t['title'], 28)}", f"t:s:{t['id']}:d")] for t in (overdue + todays)[:8]]
         buttons += [[(f"💳 Оплачено: {fmt.short(p['name'], 20)}", f"pay:{p['id']}")] for p, d in pays if d <= today]
-        return Reply("\n".join(lines), buttons)
+        return Reply(self._as_html("\n".join(lines)), buttons, html=True)
 
     def _pending_reminders(self) -> list[dict]:
         """Reminders that fired but still need an answer (no task attached or recurring)."""
@@ -1525,19 +1545,20 @@ class Service(CapitalMixin):
         if n > limit and not show_all:
             rows.append([("Показать все", "tasks:all")])
         lines.append("\nНажмите номер, чтобы изменить задачу.")
-        return Reply("\n".join(lines), rows)
+        return Reply(self._as_html("\n".join(lines)), rows, html=True)
 
     def task_card(self, tid: int) -> Reply:
         t = self.db.get("tasks", tid)
         if t is None:
             return Reply("Задача не найдена.", edit=True)
         w = self._task_when(t) or "без срока"
-        text = f"{t['title']}\nСрок: {w}\nСтатус: {fmt.STATUS_LABEL[t['status']]}"
+        text = (f"<b>{html.escape(t['title'])}</b>\nСрок: {html.escape(w)}\n"
+                f"Статус: {fmt.STATUS_LABEL[t['status']]}")
         return Reply(text, [
             [("✅ Выполнено", f"t:s:{tid}:d"), ("▶️ В процессе", f"t:s:{tid}:p"), ("⏸ Ожидает", f"t:s:{tid}:w")],
             [("📅 Перенести", f"t:r:{tid}"), ("✏️ Текст", f"t:e:{tid}")],
             [("✖️ Отменить задачу", f"t:s:{tid}:c"), ("🗑 Удалить", f"t:x:{tid}")],
-        ], edit=True)
+        ], edit=True, html=True)
 
     def _currency_row(self, prefix: str, current: str) -> list[tuple[str, str]]:
         return [(("• " if c == current else "") + c, f"{prefix}{c}") for c in self.tracked_currencies]
@@ -1586,6 +1607,8 @@ class Service(CapitalMixin):
         buttons = [[("📊 Аналитика", f"st:m:{cur}"), ("💼 Капитал", f"cap:{cur}"), ("💱 Курсы", "fx:v")],
                    self._currency_row("money:c:", cur),
                    [("Последние 20", "money:recent"), ("Как настроить", "money:help")]]
+        if self.webapp_on:
+            buttons.insert(0, [("📱 Открыть приложение", "@webapp")])
         return Reply("\n".join(lines), buttons, html=True)
 
     def view_recent_tx(self) -> Reply:
@@ -1645,7 +1668,7 @@ class Service(CapitalMixin):
         rows = [buttons[i:i + 6] for i in range(0, min(len(buttons), 18), 6)]
         nav = [("◀️", f"cal:{week_offset - 1}"), ("Эта неделя", "cal:0"), ("▶️", f"cal:{week_offset + 1}")]
         rows.append(nav)
-        return Reply("\n".join(lines), rows)
+        return Reply(self._as_html("\n".join(lines)), rows, html=True)
 
     def view_inbox(self) -> Reply:
         rows = self.db.all("SELECT * FROM inbox WHERE status = 'new' ORDER BY id")
@@ -1657,7 +1680,7 @@ class Service(CapitalMixin):
             lines.append(f"{n}. {fmt.short(r['text'], 60)}{err}")
         first = rows[0]
         lines.append(f"\nРазбираем №1: «{first['text']}»")
-        return Reply("\n".join(lines), self._inbox_buttons(first["id"]))
+        return Reply(self._as_html("\n".join(lines)), self._inbox_buttons(first["id"]), html=True)
 
     def settings_text(self) -> str:
         g = self.db.get_setting
@@ -1714,7 +1737,7 @@ class Service(CapitalMixin):
              if self.ai is not None else [])
 
     def view_settings(self) -> Reply:
-        return Reply(self.settings_text(), self.settings_buttons())
+        return Reply(self._as_html(self.settings_text()), self.settings_buttons(), html=True)
 
     def _settings_list(self) -> Reply:
         rows: Buttons = []
@@ -1886,8 +1909,11 @@ class Service(CapitalMixin):
             lines.append(warn)
         buttons = [[(("• " if k == period else "") + v, f"st:{k}:{cur}") for k, v in self.PERIODS.items()],
                    self._currency_row(f"st:{period}:", cur)]
-        if categories:
-            buttons.append([("🔎 По категориям", f"sc:{period}:{cur}")])
+        row = [("🔎 По категориям", f"sc:{period}:{cur}")] if categories else []
+        if self.webapp_on:
+            row.append(("📱 Открыть приложение", "@webapp"))
+        if row:
+            buttons.append(row)
         return Reply("\n".join(lines), buttons, photo=(f"report-{period}-{today.isoformat()}.png", png))
 
     # ------------------------------------------------------------ export
@@ -2110,7 +2136,7 @@ class Service(CapitalMixin):
             key = parts[2]
             with self.db.tx():
                 self.db.set_setting(key, "0" if self.db.get_setting(key) == "1" else "1")
-            return Reply(self.settings_text(), self.settings_buttons(), edit=True)
+            return Reply(self._as_html(self.settings_text()), self.settings_buttons(), edit=True, html=True)
         if op == "ask":
             key = parts[2]
             self._set_pending("setting", key=key)
@@ -2256,7 +2282,7 @@ class Service(CapitalMixin):
             lines.append(f"\n💸 Можно тратить сегодня: {fmt.money(allowance, self.currency)}")
         buttons = [[(f"💳 Оплачено: {fmt.short(p['name'], 20)}", f"pay:{p['id']}")] for p, d in pays if d <= today]
         buttons.append([("📅 Сегодня", "menu:today"), ("✅ Задачи", "menu:tasks")])
-        return Reply("\n".join(lines), buttons)
+        return Reply(self._as_html("\n".join(lines)), buttons, html=True)
 
     def evening_digest(self) -> Reply:
         today = self.today()
@@ -2284,7 +2310,7 @@ class Service(CapitalMixin):
         buttons = []
         if open_today:
             buttons.append([("Перенести незавершённое на завтра", "t:all:0:tom")])
-        return Reply("\n".join(lines), buttons)
+        return Reply(self._as_html("\n".join(lines)), buttons, html=True)
 
     def move_open_to_tomorrow(self) -> Reply:
         today = self.today()

@@ -74,7 +74,7 @@ def test_full_flow(svc, tmp_path):
 
     asyncio.run(go())
     sent = [c for c in session.calls if isinstance(c, SendMessage)]
-    assert "Personal OS" in sent[0].text
+    assert "Kompas" in sent[0].text and sent[0].parse_mode == "HTML"
     assert sent[1].text.startswith("Записал: −18 AED")
     assert sent[1].reply_markup.inline_keyboard[0][0].text == "Отменить"
     assert sent[2].text.startswith("💰 <b>Деньги") and sent[2].parse_mode == "HTML"
@@ -97,3 +97,54 @@ def test_stats_sends_photo(svc, tmp_path):
     photos = [c for c in session.calls if isinstance(c, SendPhoto)]
     assert len(photos) == 1 and photos[0].caption.startswith("📊")
     assert photos[0].reply_markup.inline_keyboard[0][1].callback_data == "st:m:AED"
+
+
+def test_webapp_buttons_and_menu(svc, tmp_path):
+    from aiogram.methods import SetChatMenuButton
+    import bot.telegram_app as ta
+    cfg = Config("1:x", OWNER, tmp_path / "db", tmp_path / "b", 3, tmp_path / "l", "Asia/Dubai",
+                 webapp_url="https://me.github.io/kompas/")
+    session = FakeSession()
+    bot = Bot("123456:ABCDEF", session=session)
+    dp = Dispatcher()
+    dp.update.outer_middleware(OwnerOnly(OWNER))
+    dp.include_router(build_router(svc, cfg))
+    from bot import webapp
+    svc.webapp_on = True
+    ta.WEBAPP_LINK = lambda tab: webapp.url(svc, cfg.webapp_url) + (f"&tab={tab}" if tab else "")
+    svc.process_text("Кофе 18", 1)
+
+    async def go():
+        await dp.feed_update(bot, msg_update(OWNER, "/capital", 2, 2))
+        await dp.feed_update(bot, msg_update(OWNER, "/money", 3, 3))
+        ta._menu_state.update({"version": None, "at": -1e9})
+        await ta.update_menu_button(bot, svc, cfg)
+
+    asyncio.run(go())
+    sent = [c for c in session.calls if isinstance(c, SendMessage)]
+    money_kb = sent[-1].reply_markup.inline_keyboard
+    assert money_kb[0][0].web_app.url.startswith("https://me.github.io/kompas/#d=")
+    menu = [c for c in session.calls if isinstance(c, SetChatMenuButton)]
+    assert menu and menu[0].menu_button.web_app.url.startswith("https://me.github.io/kompas/#d=")
+    ta.WEBAPP_LINK = None
+
+
+def test_webapp_button_dropped_when_rejected(svc, tmp_path):
+    from aiogram.exceptions import TelegramBadRequest
+    import bot.telegram_app as ta
+    from bot.service import Reply
+
+    class Picky(FakeSession):
+        async def make_request(self, bot, method, timeout=None):
+            mk = getattr(method, "reply_markup", None)
+            if mk and any(b.web_app for row in mk.inline_keyboard for b in row):
+                raise TelegramBadRequest(method=method, message="Bad Request: BUTTON_URL_INVALID")
+            return await super().make_request(bot, method, timeout)
+
+    session = Picky()
+    bot = Bot("123456:ABCDEF", session=session)
+    ta.WEBAPP_LINK = lambda tab: "https://x/app#d=abc"
+    asyncio.run(ta.send(bot, OWNER, Reply("hi", [[("📱", "@webapp"), ("ok", "x:1")]])))
+    sent = [c for c in session.calls if isinstance(c, SendMessage)]
+    assert len(sent) == 1 and [b.text for b in sent[0].reply_markup.inline_keyboard[0]] == ["ok"]
+    ta.WEBAPP_LINK = None

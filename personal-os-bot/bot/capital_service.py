@@ -442,6 +442,8 @@ class CapitalMixin:
         acc_buttons = [(f"{KIND_ICON[s.kind]} {fmt.short(s.name, 18)}", f"acc:{s.id}:{cur}") for s, _ in accounts]
         buttons += [acc_buttons[i:i + 2] for i in range(0, len(acc_buttons), 2)]
         buttons.append([("❓ Как вести учёт", "cap:help"), ("💱 Курсы", "fx:v")])
+        if self.webapp_on:
+            buttons.insert(0, [("📱 Открыть приложение", "@webapp:cap")])
         return Reply("\n".join(lines), buttons, html=True)
 
     def account_card(self, account_id: int, cur: str | None = None):

@@ -30,6 +30,8 @@ class Config:
     backup_keep: int
     log_dir: Path
     timezone: str
+    webapp_url: str = ""
+    webapp_max_url: int = 6000
 
 
 def _path(value: str) -> Path:
@@ -49,4 +51,6 @@ def load_config() -> Config:
         backup_keep=int(os.environ.get("BACKUP_KEEP", "14")),
         log_dir=_path(os.environ.get("LOG_DIR", "logs")),
         timezone=os.environ.get("DEFAULT_TIMEZONE", "Asia/Dubai"),
+        webapp_url=os.environ.get("WEBAPP_URL", "").strip(),
+        webapp_max_url=int(os.environ.get("WEBAPP_MAX_URL", "6000")),
     )

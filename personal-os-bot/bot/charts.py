@@ -96,7 +96,7 @@ class Report:
     bars_title: str
     bar_reference: tuple[str, int] | None = None   # ("бюджет/день", minor)
     top: list[tuple[str, str, int]] = field(default_factory=list)  # (date label, description, amount)
-    footer: str = "Personal OS · по записям в боте, не банковские данные"
+    footer: str = "Kompas · по записям в боте, не банковские данные"
     colors: dict[str, int] = field(default_factory=dict)   # category -> palette slot
 
 
@@ -342,7 +342,7 @@ class CapitalReport:
     colors: dict[str, int]
     history: list[tuple[str, int]]             # (day ISO, value minor)
     holdings: list[tuple[str, str, int, float | None]]   # (symbol, qty, value minor, pnl %)
-    footer: str = "Personal OS · оценка по последним известным ценам и курсам"
+    footer: str = "Kompas · оценка по последним известным ценам и курсам"
 
 
 def _line_chart(c: Canvas, x0, y0, x1, y1, points: list[tuple[str, int]], cur: str) -> None:

@@ -160,7 +160,7 @@ def test_completing_task_disables_reminder(svc, mid, clock):
 def test_task_card_status_reschedule_delete(svc, mid):
     svc.process_text("Завтра в 11 позвонить преподавателю", mid())
     tid = svc.db.scalar("SELECT id FROM tasks")
-    assert "Статус: Новая" in svc.handle_callback(f"t:o:{tid}").text
+    assert "Статус: Новая" in plain(svc.handle_callback(f"t:o:{tid}").text)
     svc.handle_callback(f"t:s:{tid}:p")
     assert svc.db.scalar("SELECT status FROM tasks") == "in_progress"
     svc.handle_callback(f"t:rd:{tid}:7")
@@ -209,14 +209,14 @@ def test_several_due_reminders_are_grouped(svc, mid, clock):
 def test_today_view(svc, mid):
     svc.process_text("Сегодня купить продукты", mid())
     svc.process_text("Кофе 18", mid())
-    t = svc.view_today().text
+    t = plain(svc.view_today().text)
     assert "Купить продукты" in t and "Расходы сегодня: 18 AED" in t
 
 
 def test_overdue_shown(svc, mid, clock):
     svc.process_text("Сегодня купить продукты", mid())
     clock.advance(days=2)
-    assert "Просрочено" in svc.view_today().text
+    assert "Просрочено" in plain(svc.view_today().text)
 
 
 def test_money_summary(svc, mid, clock):

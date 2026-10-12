@@ -221,3 +221,20 @@ def test_monthly_report_sent_on_first_day(svc, mid, clock):
 
 def test_money_view_links_to_analytics(svc):
     assert any(d == "st:m:AED" for row in svc.view_money().buttons for _, d in row)
+
+
+def test_ai_capital_phrase_goes_through_strict_parser(ai_svc, mid):
+    svc, _ = ai_svc({"items": [{"type": "capital", "title": "закинул 50000 KZT на брокерский, вышло 104 USD"},
+                               {"type": "expense", "amount": 12, "description": "кофе", "category": "Кафе и рестораны"}]})
+    r = svc.process_text("короче скинул полтинник тенге брокеру, там 104 бакса получилось, ну и кофе 12", mid())
+    assert "Брокерский счёт: <b>+104 USD</b>" in r.text and "−12 AED" in r.text
+    svc.handle_callback(r.buttons[0][0][1])   # one undo for everything
+    assert svc.db.scalar("SELECT COUNT(*) FROM moves") == 0 and svc.db.scalar("SELECT COUNT(*) FROM accounts") == 0
+    assert svc.db.scalar("SELECT COUNT(*) FROM transactions") == 0
+
+
+def test_ai_capital_phrase_rejected_saves_nothing(ai_svc, mid):
+    svc, _ = ai_svc({"items": [{"type": "expense", "amount": 12, "description": "кофе"},
+                               {"type": "capital", "title": "что-то непонятное с деньгами"}]})
+    r = svc.process_text("бла бла непонятно", mid())
+    assert "Inbox" in r.text and svc.db.scalar("SELECT COUNT(*) FROM transactions") == 0

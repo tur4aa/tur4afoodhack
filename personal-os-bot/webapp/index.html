@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kompas</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f4f4f1; --surface: #fcfcfb; --surface-2: #f0efec; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --base: #c3c2b7; --ring: rgba(11,11,11,.10); --accent: #2a78d6; --accent-soft: #86b6ef;
+  --good: #006300; --good-bg: rgba(12,163,12,.14); --bad: #b42323; --bad-bg: rgba(208,59,59,.14); --other: #a9a8a2;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #262624; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --base: #383835; --ring: rgba(255,255,255,.10); --accent: #3987e5; --accent-soft: #1c5cab;
+  --good: #0ca30c; --good-bg: rgba(12,163,12,.22); --bad: #e66767; --bad-bg: rgba(208,59,59,.24); --other: #6b6a66;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; background: var(--page); color: var(--ink);
+  font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+body { padding: 0 16px calc(24px + env(safe-area-inset-bottom)); max-width: 640px; margin: 0 auto; }
+button { font: inherit; color: inherit; }
+.top { position: sticky; top: 0; z-index: 5; background: var(--page); padding: 12px 0 10px; }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; background: var(--surface-2); border-radius: 12px; padding: 3px; }
+.tabs button { border: 0; background: transparent; padding: 8px; border-radius: 10px; font-weight: 600; color: var(--ink-2); }
+.tabs button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px var(--ring); }
+.filters { display: flex; gap: 6px; margin-top: 10px; overflow-x: auto; scrollbar-width: none; }
+.filters::-webkit-scrollbar { display: none; }
+.chip { border: 1px solid var(--ring); background: var(--surface); border-radius: 999px; padding: 6px 12px;
+  white-space: nowrap; font-size: 13px; color: var(--ink-2); min-height: 32px; }
+.chip[aria-pressed="true"] { background: var(--ink); color: var(--surface); border-color: var(--ink); font-weight: 600; }
+.sep { width: 1px; background: var(--grid); flex: 0 0 1px; margin: 4px 2px; }
+.card { background: var(--surface); border-radius: 20px; padding: 18px; margin-top: 12px; box-shadow: 0 0 0 1px var(--ring); }
+.label { color: var(--ink-2); font-size: 13px; }
+.hero { font-size: 44px; font-weight: 700; letter-spacing: -.02em; line-height: 1.1; margin: 6px 0 8px; }
+.hero small { font-size: 20px; font-weight: 500; color: var(--ink-2); margin-left: 6px; letter-spacing: 0; }
+.delta { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--ink-2); }
+.pill { border-radius: 999px; padding: 3px 9px; font-weight: 600; color: var(--ink); font-size: 13px; }
+.pill.good { background: var(--good-bg); } .pill.bad { background: var(--bad-bg); }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.kpi { background: var(--surface); border-radius: 16px; padding: 12px; box-shadow: 0 0 0 1px var(--ring); min-width: 0; }
+.kpi .v { font-size: 19px; font-weight: 700; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+h2 { font-size: 17px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: baseline; }
+h2 button { border: 0; background: none; color: var(--accent); font-size: 13px; font-weight: 600; padding: 4px 0; }
+.stack { display: flex; height: 12px; border-radius: 6px; overflow: hidden; gap: 2px; background: var(--surface); margin-bottom: 8px; }
+.stack span { display: block; height: 100%; min-width: 3px; }
+.row { display: grid; grid-template-columns: 12px 1fr auto; gap: 4px 10px; align-items: center; width: 100%;
+  border: 0; background: transparent; padding: 10px 0; text-align: left; border-bottom: 1px solid var(--grid); }
+.row:last-child { border-bottom: 0; }
+.row.dim { opacity: .45; }
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+.row .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .amt { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+.row .sub { grid-column: 2 / 4; display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; }
+.track { flex: 1; height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+.track i { display: block; height: 100%; border-radius: 3px; }
+svg { display: block; width: 100%; overflow: visible; }
+svg text { fill: var(--muted); font-size: 11px; font-family: inherit; }
+.tip { position: fixed; z-index: 20; pointer-events: none; background: var(--ink); color: var(--surface); border-radius: 10px;
+  padding: 7px 10px; font-size: 12px; transform: translate(-50%, calc(-100% - 10px)); opacity: 0; transition: opacity .12s; }
+.tip b { display: block; font-size: 14px; }
+.tip.on { opacity: 1; }
+.list .day { color: var(--muted); font-size: 12px; margin: 14px 0 4px; }
+.tx { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--grid); }
+.tx .d { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tx .c { color: var(--muted); font-size: 12px; }
+.tx .a { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+.tx .o { color: var(--muted); font-size: 12px; text-align: right; }
+.tx .a.plus { color: var(--good); }
+input[type=search] { width: 100%; border: 0; background: var(--surface-2); color: var(--ink); border-radius: 10px;
+  padding: 9px 12px; font: inherit; margin-bottom: 4px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+td, th { padding: 6px 0; border-bottom: 1px solid var(--grid); text-align: left; } td:last-child, th:last-child { text-align: right; }
+th { color: var(--muted); font-weight: 500; }
+.empty { color: var(--muted); padding: 8px 0; }
+.hold { display: grid; grid-template-columns: 1fr auto auto; gap: 8px; padding: 8px 0 8px 22px; font-size: 14px;
+  border-bottom: 1px solid var(--grid); align-items: center; }
+.hold .q { color: var(--muted); font-size: 12px; }
+.note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="tabs" role="tablist">
+    <button id="t-spend" aria-pressed="true">Расходы</button>
+    <button id="t-cap" aria-pressed="false">Капитал</button>
+  </div>
+  <div class="filters" id="filters"></div>
+</div>
+
+<main id="spend">
+  <section class="card">
+    <div class="label" id="s-period"></div>
+    <div class="hero" id="s-total"></div>
+    <div class="delta" id="s-delta"></div>
+  </section>
+  <div class="kpis" id="s-kpis"></div>
+  <section class="card">
+    <h2><span>Категории</span><button id="s-clear" hidden>Все категории</button></h2>
+    <div class="stack" id="s-stack" role="img"></div>
+    <div id="s-cats"></div>
+  </section>
+  <section class="card">
+    <h2><span id="s-bars-title">По дням</span><button id="s-bars-table">Таблица</button></h2>
+    <div id="s-bars"></div>
+    <div id="s-bars-tab" hidden></div>
+  </section>
+  <section class="card list">
+    <h2><span id="s-list-title">Операции</span></h2>
+    <input type="search" id="s-search" placeholder="Поиск по описанию">
+    <div id="s-list"></div>
+  </section>
+</main>
+
+<main id="capital" hidden>
+  <section class="card">
+    <div class="label">Капитал · все счета, инвестиции и кошелёк</div>
+    <div class="hero" id="c-total"></div>
+    <div class="delta" id="c-delta"></div>
+  </section>
+  <div class="kpis" id="c-kpis"></div>
+  <section class="card">
+    <h2><span>Где деньги</span></h2>
+    <div class="stack" id="c-stack" role="img"></div>
+    <div id="c-acc"></div>
+  </section>
+  <section class="card">
+    <h2><span>Динамика</span><button id="c-line-table">Таблица</button></h2>
+    <div id="c-line"></div>
+    <div id="c-line-tab" hidden></div>
+  </section>
+  <p class="note" id="c-note"></p>
+</main>
+<p class="note" id="foot"></p>
+<div class="tip" id="tip" role="status"></div>
+
+<script>
+"use strict";
+const TG = window.Telegram && window.Telegram.WebApp;
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+const MONTHS = ["январь","февраль","март","апрель","май","июнь","июль","август","сентябрь","октябрь","ноябрь","декабрь"];
+const MON_G = ["янв","фев","мар","апр","мая","июн","июл","авг","сен","окт","ноя","дек"];
+const WD = ["вс","пн","вт","ср","чт","пт","сб"];
+const KIND = {savings:"сбережения", broker:"брокерский", deposit:"депозит", crypto:"крипто", asset:"имущество", other:"другое"};
+const SERIES = n => `var(--s${n + 1})`;
+const state = { tab: "spend", period: "m", cur: "AED", cat: null, acc: null, q: "" };
+let D = null;
+
+// ------------------------------------------------------------------ data
+async function inflate(b64) {
+  const bin = atob(b64.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64.length + 3) % 4));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return JSON.parse(await new Response(stream).text());
+}
+function param(name) {
+  const h = new URLSearchParams(location.hash.slice(1)); if (h.get(name)) return h.get(name);
+  return new URLSearchParams(location.search).get(name);
+}
+async function load() {
+  const token = param("d");
+  if (token) { try { return await inflate(token); } catch (e) { console.error(e); } }
+  return demo();
+}
+
+// ------------------------------------------------------------------ helpers
+const dayOf = s => { const [y, m, d] = s.split("-").map(Number); return new Date(Date.UTC(y, m - 1, d)); };
+const addDays = (d, n) => new Date(d.getTime() + n * 864e5);
+const iso = d => d.toISOString().slice(0, 10);
+const diffDays = (a, b) => Math.round((a - b) / 864e5);
+function conv(usd, cur) { return usd * (D.fx[cur] || 1); }
+function fmt(minorUsd, cur, opts = {}) {
+  const v = conv(minorUsd, cur || state.cur) / 100;
+  const abs = Math.abs(v), dec = abs >= 1000 || opts.whole ? 0 : (Math.round(abs * 100) % 100 ? 2 : 0);
+  const s = abs.toLocaleString("ru-RU", { minimumFractionDigits: dec, maximumFractionDigits: dec }).replace(/,/g, ".");
+  return (v < 0 ? "−" : opts.sign && v > 0 ? "+" : "") + s;
+}
+function fmtNative(minor, cur) {
+  const v = minor / 100, abs = Math.abs(v), dec = Math.round(abs * 100) % 100 && abs < 1000 ? 2 : 0;
+  return abs.toLocaleString("ru-RU", { minimumFractionDigits: dec, maximumFractionDigits: dec }).replace(/,/g, ".") + " " + cur;
+}
+function dayLabel(d) {
+  const today = dayOf(D.today), n = diffDays(d, today);
+  if (n === 0) return "сегодня"; if (n === -1) return "вчера";
+  return `${WD[d.getUTCDay()]}, ${d.getUTCDate()} ${MON_G[d.getUTCMonth()]}`;
+}
+function haptic() { try { TG && TG.HapticFeedback.selectionChanged(); } catch (e) {} }
+const tip = $("tip");
+function showTip(x, y, value, label) {
+  tip.replaceChildren(el("b", null, value), document.createTextNode(label));
+  tip.style.left = Math.min(Math.max(x, 70), innerWidth - 70) + "px"; tip.style.top = y + "px"; tip.classList.add("on");
+}
+function hideTip() { tip.classList.remove("on"); }
+document.addEventListener("scroll", hideTip, { passive: true });
+
+// ------------------------------------------------------------------ periods
+function range(p) {
+  const t = dayOf(D.today);
+  const som = d => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+  if (p === "w") { const s = addDays(t, -((t.getUTCDay() + 6) % 7)); return [s, t, "Эта неделя"]; }
+  if (p === "pm") { const e = addDays(som(t), -1); return [som(e), e, MONTHS[e.getUTCMonth()]]; }
+  if (p === "3") { const s = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() - 2, 1)); return [s, t, "3 месяца"]; }
+  if (p === "6") { const s = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() - 5, 1)); return [s, t, "Полгода"]; }
+  return [som(t), t, MONTHS[t.getUTCMonth()][0].toUpperCase() + MONTHS[t.getUTCMonth()].slice(1)];
+}
+function prevRange(p, s, e) {
+  if (p === "m") { const ps = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth() - 1, 1));
+    const len = diffDays(e, s); const pe = addDays(ps, len); const pend = addDays(s, -1); return [ps, pe < pend ? pe : pend]; }
+  if (p === "pm") { const pe = addDays(s, -1); return [new Date(Date.UTC(pe.getUTCFullYear(), pe.getUTCMonth(), 1)), pe]; }
+  const len = diffDays(e, s) + 1; return [addDays(s, -len), addDays(s, -1)];
+}
+const start0 = () => dayOf(D.start);
+function txIn(s, e) {
+  const a = diffDays(s, start0()), b = diffDays(e, start0());
+  return D.tx.filter(t => t[0] >= a && t[0] <= b);
+}
+const net = rows => rows.reduce((acc, t) => acc + (t[3] === 0 ? t[2] : t[3] === 2 ? -t[2] : 0), 0);
+
+// ------------------------------------------------------------------ filters row
+function chip(text, pressed, onClick, aria) {
+  const b = el("button", "chip", text); b.setAttribute("aria-pressed", String(pressed));
+  if (aria) b.setAttribute("aria-label", aria); b.onclick = () => { haptic(); onClick(); }; return b;
+}
+function renderFilters() {
+  const f = $("filters"); f.replaceChildren();
+  if (state.tab === "spend") {
+    [["w","Неделя"],["m","Месяц"],["pm","Прошлый"],["3","3 мес"],["6","Полгода"]].forEach(([k, t]) =>
+      f.append(chip(t, state.period === k, () => { state.period = k; render(); })));
+    f.append(el("span", "sep"));
+  }
+  D.cs.forEach(c => { if (D.fx[c]) f.append(chip(c, state.cur === c, () => { state.cur = c; render(); }, "Валюта " + c)); });
+}
+
+// ------------------------------------------------------------------ spend tab
+function catColor(i) { const slot = D.col[D.cats[i]]; return slot == null ? "var(--other)" : SERIES(slot); }
+function renderSpend() {
+  const [s, e, label] = range(state.period);
+  const rows = txIn(s, e);
+  const [ps, pe] = prevRange(state.period, s, e);
+  const prevRows = txIn(ps, pe);
+  const filt = state.cat == null ? rows : rows.filter(t => t[1] === state.cat);
+  const total = net(filt);
+  const prev = net(state.cat == null ? prevRows : prevRows.filter(t => t[1] === state.cat));
+  $("s-period").textContent = `Расходы · ${label}` + (state.cat != null ? ` · ${D.cats[state.cat]}` : "");
+  $("s-total").replaceChildren(document.createTextNode(fmt(total, null, { whole: total > 100000 })), el("small", null, state.cur));
+  const dl = $("s-delta"); dl.replaceChildren();
+  if (prev > 0) {
+    const pct = Math.round((total - prev) * 100 / prev);
+    dl.append(el("span", "pill " + (pct > 0 ? "bad" : "good"), (pct > 0 ? "▲ " : pct < 0 ? "▼ " : "• ") + Math.abs(pct) + "%"),
+              el("span", null, state.period === "m" ? "к прошлому месяцу за те же дни" : "к прошлому периоду"));
+  } else if (prevRows.length === 0) dl.append(el("span", null, "Для сравнения пока мало данных"));
+  // KPIs
+  const days = diffDays(e, s) + 1;
+  const income = rows.filter(t => t[3] === 1).reduce((a, t) => a + t[2], 0);
+  const kp = $("s-kpis"); kp.replaceChildren();
+  const k = (l, v) => { const d = el("div", "kpi"); d.append(el("div", "label", l), el("div", "v", v)); kp.append(d); };
+  k("Доходы", income ? fmt(income, null, { sign: true, whole: true }) : "0");
+  k("В день", fmt(Math.round(total / days), null, { whole: true }));
+  if (D.pay && D.pay.perDay != null && (state.period === "m" || state.period === "w")) k("Можно сегодня", fmt(D.pay.perDay, null, { whole: true }));
+  else k("Операций", String(filt.filter(t => t[3] === 0).length));
+  // categories
+  const by = new Map();
+  rows.forEach(t => { if (t[3] === 1) return; by.set(t[1], (by.get(t[1]) || 0) + (t[3] === 0 ? t[2] : -t[2])); });
+  const cats = [...by.entries()].filter(x => x[1] > 0).sort((a, b) => b[1] - a[1]);
+  const sum = cats.reduce((a, x) => a + x[1], 0) || 1;
+  const stack = $("s-stack"); stack.replaceChildren();
+  stack.setAttribute("aria-label", "Доли категорий: " + cats.map(([i, v]) => `${D.cats[i]} ${Math.round(v * 100 / sum)}%`).join(", "));
+  cats.forEach(([i, v]) => { const sp = el("span"); sp.style.flex = String(v); sp.style.background = catColor(i);
+    sp.style.opacity = state.cat == null || state.cat === i ? 1 : .25; stack.append(sp); });
+  const list = $("s-cats"); list.replaceChildren();
+  const monthly = state.period === "m" || state.period === "pm";
+  if (!cats.length) list.append(el("div", "empty", "Расходов за период нет"));
+  cats.forEach(([i, v]) => {
+    const b = el("button", "row" + (state.cat != null && state.cat !== i ? " dim" : ""));
+    b.setAttribute("aria-pressed", String(state.cat === i));
+    const dot = el("span", "dot"); dot.style.background = catColor(i);
+    const sub = el("span", "sub"); const tr = el("span", "track"); const bar = el("i");
+    const lim = monthly ? D.limits[D.cats[i]] : null;
+    const frac = lim ? Math.min(v / lim, 1) : v / cats[0][1];
+    bar.style.width = (frac * 100).toFixed(1) + "%"; bar.style.background = lim && v > lim ? "var(--bad)" : catColor(i);
+    tr.append(bar);
+    sub.append(el("span", null, Math.round(v * 100 / sum) + "%"), tr);
+    if (lim) sub.append(el("span", null, (v > lim ? "лимит превышен · " : "лимит ") + fmt(lim, null, { whole: true })));
+    b.append(dot, el("span", "name", D.cats[i]), el("span", "amt", fmt(v)), sub);
+    b.onclick = () => { haptic(); state.cat = state.cat === i ? null : i; render(); };
+    list.append(b);
+  });
+  $("s-clear").hidden = state.cat == null;
+  renderBars(s, e, filt);
+  renderList(filt);
+}
+$("s-clear").onclick = () => { state.cat = null; render(); };
+
+function buckets(s, e, rows) {
+  const days = diffDays(e, s) + 1;
+  const out = [];
+  if (days <= 31) {
+    for (let i = 0; i < (state.period === "w" ? 7 : (state.period === "m" ? new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth() + 1, 0)).getUTCDate() : days)); i++) {
+      const d = addDays(s, i); const off = diffDays(d, start0());
+      out.push({ label: state.period === "w" ? WD[d.getUTCDay()] : String(d.getUTCDate()), full: dayLabel(d),
+        v: d > e ? null : net(rows.filter(t => t[0] === off)), cur: iso(d) === D.today });
+    }
+    $("s-bars-title").textContent = "По дням";
+  } else {
+    let m = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth(), 1));
+    while (m <= e) {
+      const me = new Date(Date.UTC(m.getUTCFullYear(), m.getUTCMonth() + 1, 0));
+      const a = diffDays(m, start0()), b = diffDays(me, start0());
+      out.push({ label: MON_G[m.getUTCMonth()].replace("мая", "май"), full: MONTHS[m.getUTCMonth()],
+        v: net(rows.filter(t => t[0] >= a && t[0] <= b)), cur: me >= dayOf(D.today) });
+      m = new Date(Date.UTC(m.getUTCFullYear(), m.getUTCMonth() + 1, 1));
+    }
+    $("s-bars-title").textContent = "По месяцам";
+  }
+  return out;
+}
+function niceMax(v) { if (v <= 0) return 1; const p = Math.pow(10, Math.floor(Math.log10(v))); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p; return v; }
+function axisLabel(minorUsd) { const v = conv(minorUsd, state.cur) / 100; return Math.abs(v) >= 1000 ? (v / 1000).toFixed(v % 1000 ? 1 : 0).replace(".0", "") + "K" : String(Math.round(v)); }
+function renderBars(s, e, rows) {
+  const host = $("s-bars"); const data = buckets(s, e, rows);
+  const W = host.clientWidth || 340, H = 190, L = 36, B = 22, T = 8;
+  const max = niceMax(Math.max(...data.map(x => conv(x.v || 0, state.cur)), 1)) / (D.fx[state.cur] || 1);
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg"); svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("height", H);
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Расходы: " + data.filter(x => x.v).map(x => `${x.full} ${fmt(x.v)}`).join(", "));
+  const mk = (tag, attrs) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+  for (let k = 0; k <= 2; k++) {
+    const y = T + (H - B - T) * (1 - k / 2);
+    svg.append(mk("line", { x1: L, x2: W, y1: y, y2: y, stroke: k ? "var(--grid)" : "var(--base)", "stroke-width": 1 }));
+    const t = mk("text", { x: L - 6, y: y + 4, "text-anchor": "end" }); t.textContent = axisLabel(max * k / 2); svg.append(t);
+  }
+  const slot = (W - L) / data.length, bw = Math.min(24, slot * .62);
+  const color = state.cat != null ? catColor(state.cat) : "var(--accent)";
+  const every = data.length > 20 ? 5 : data.length > 12 ? 3 : 1;
+  data.forEach((x, i) => {
+    const cx = L + slot * i + slot / 2;
+    if (x.v > 0) {
+      const h = Math.max((H - B - T) * x.v / max, 3), y = H - B - h, r = Math.min(4, bw / 2);
+      const p = mk("path", { d: `M${cx - bw / 2},${H - B} V${y + r} q0,-${r} ${r},-${r} H${cx + bw / 2 - r} q${r},0 ${r},${r} V${H - B} Z`,
+        fill: color, opacity: x.cur || state.cat != null ? 1 : .55 });
+      svg.append(p);
+    }
+    const hit = mk("rect", { x: L + slot * i, y: T, width: slot, height: H - B - T, fill: "transparent", tabindex: 0 });
+    const show = ev => { const r = hit.getBoundingClientRect(); showTip(r.left + r.width / 2, r.top + (H - B - T) * .2,
+      x.v == null ? "—" : fmt(x.v) + " " + state.cur, x.full); };
+    hit.addEventListener("pointerenter", show); hit.addEventListener("pointerdown", show); hit.addEventListener("focus", show);
+    hit.addEventListener("pointerleave", hideTip); hit.addEventListener("blur", hideTip);
+    svg.append(hit);
+    const curI = data.findIndex(z => z.cur);
+    const nearCur = curI >= 0 && !x.cur && Math.abs(i - curI) <= (every > 1 ? 1 : 0);
+    if (x.cur || (i % every === 0 && !nearCur)) { const t = mk("text", { x: cx, y: H - 6, "text-anchor": "middle" });
+      t.textContent = x.label; if (x.cur) { t.style.fill = "var(--ink)"; t.style.fontWeight = 600; } svg.append(t); }
+  });
+  host.replaceChildren(svg);
+  const tab = $("s-bars-tab"); const table = el("table"); const head = el("tr"); head.append(el("th", null, "Период"), el("th", null, state.cur));
+  table.append(head); data.filter(x => x.v != null).forEach(x => { const tr = el("tr"); tr.append(el("td", null, x.full), el("td", null, fmt(x.v || 0))); table.append(tr); });
+  tab.replaceChildren(table);
+}
+$("s-bars-table").onclick = () => { const t = $("s-bars-tab"), c = $("s-bars"); t.hidden = !t.hidden; c.hidden = !t.hidden;
+  $("s-bars-table").textContent = t.hidden ? "Таблица" : "График"; };
+
+function renderList(rows) {
+  const host = $("s-list"); host.replaceChildren();
+  const q = state.q.trim().toLowerCase();
+  const items = rows.filter(t => !q || (D.ds[t[4]] || "").toLowerCase().includes(q) || D.cats[t[1]].toLowerCase().includes(q))
+    .slice().sort((a, b) => b[0] - a[0]);
+  $("s-list-title").textContent = `Операции · ${items.length}`;
+  if (!items.length) { host.append(el("div", "empty", "Ничего не найдено")); return; }
+  let last = null;
+  items.slice(0, 150).forEach(t => {
+    if (t[0] !== last) { last = t[0]; const l = dayLabel(addDays(start0(), t[0]));
+      host.append(el("div", "day", l[0].toUpperCase() + l.slice(1))); }
+    const r = el("div", "tx");
+    const sign = t[3] === 0 ? "−" : "+";
+    const a = el("div", "a" + (t[3] !== 0 ? " plus" : ""), sign + fmt(t[2]));
+    r.append(el("div", "d", D.ds[t[4]] || D.cats[t[1]]), a,
+             el("div", "c", t[3] === 1 ? "доход" : t[3] === 2 ? "возврат · " + D.cats[t[1]] : D.cats[t[1]]),
+             el("div", "o", t.length > 5 && D.oc[t[5]] !== state.cur ? fmtNative(t[6], D.oc[t[5]]) : ""));
+    host.append(r);
+  });
+}
+$("s-search").addEventListener("input", ev => { state.q = ev.target.value; const [s, e] = range(state.period);
+  const rows = txIn(s, e); renderList(state.cat == null ? rows : rows.filter(t => t[1] === state.cat)); });
+
+// ------------------------------------------------------------------ capital tab
+function accColor(slot) { return slot == null || slot < 0 ? "var(--other)" : SERIES(slot); }
+function renderCapital() {
+  const C = D.cap;
+  if (!C) { $("c-total").textContent = "—"; $("c-note").textContent = "Капитал пока пуст. Напишите боту, например: «закинул 50к тенге на брокерский, вышло 110$» или «остаток 2400»."; return; }
+  const wallet = C.wallet.reduce((a, w) => a + w[2], 0);
+  const accSum = C.acc.reduce((a, x) => a + x[2], 0);
+  const total = wallet + accSum, invested = C.acc.reduce((a, x) => a + x[3], 0);
+  $("c-total").replaceChildren(document.createTextNode(fmt(total, null, { whole: total > 100000 })), el("small", null, state.cur));
+  const dl = $("c-delta"); dl.replaceChildren();
+  const past = C.hist.filter(h => h[0] <= -30).pop() || C.hist[0];
+  if (past && past[0] < 0 && past[1] > 0) {
+    const pct = (total - past[1]) * 100 / past[1];
+    dl.append(el("span", "pill " + (pct >= 0 ? "good" : "bad"), (pct >= 0 ? "▲ " : "▼ ") + Math.abs(pct).toFixed(1) + "%"),
+              el("span", null, `${fmt(total - past[1], null, { sign: true, whole: true })} за ${-past[0]} дн.`));
+  }
+  const kp = $("c-kpis"); kp.replaceChildren();
+  const k = (l, v) => { const d = el("div", "kpi"); d.append(el("div", "label", l), el("div", "v", v)); kp.append(d); };
+  k("Вложено", fmt(invested, null, { whole: true })); k("Результат", fmt(accSum - invested, null, { sign: true, whole: true }));
+  k("Кошелёк", fmt(wallet, null, { whole: true }));
+  const parts = C.acc.map((a, i) => ({ i, name: a[0], sub: KIND[a[1]] || a[1], v: a[2], inv: a[3], native: [a[5], a[4]], slot: a[6], rate: a[7] }));
+  if (wallet > 0) parts.push({ i: -1, name: "Кошелёк", sub: C.wallet.map(w => fmtNative(w[1], w[0])).join(" · "), v: wallet, slot: C.walletColor });
+  parts.sort((a, b) => b.v - a.v);
+  const sum = parts.reduce((a, p) => a + Math.max(p.v, 0), 0) || 1;
+  const stack = $("c-stack"); stack.replaceChildren();
+  stack.setAttribute("aria-label", "Распределение: " + parts.map(p => `${p.name} ${Math.round(p.v * 100 / sum)}%`).join(", "));
+  parts.filter(p => p.v > 0).forEach(p => { const sp = el("span"); sp.style.flex = String(p.v); sp.style.background = accColor(p.slot); stack.append(sp); });
+  const host = $("c-acc"); host.replaceChildren();
+  parts.forEach(p => {
+    const b = el("button", "row"); const dot = el("span", "dot"); dot.style.background = accColor(p.slot);
+    const sub = el("span", "sub");
+    sub.append(el("span", null, `${Math.round(p.v * 100 / sum)}% · ${p.sub}`));
+    if (p.inv && p.i >= 0 && C.acc[p.i][1] !== "asset") { const pnl = p.v - p.inv;
+      sub.append(el("span", null, `${fmt(pnl, null, { sign: true, whole: true })} (${(pnl * 100 / p.inv).toFixed(1)}%)`)); }
+    if (p.rate) sub.append(el("span", null, p.rate + "% год."));
+    b.append(dot, el("span", "name", p.name), el("span", "amt", fmt(p.v, null, { whole: p.v > 100000 })), sub);
+    b.setAttribute("aria-expanded", String(state.acc === p.i));
+    b.onclick = () => { haptic(); state.acc = state.acc === p.i ? null : p.i; renderCapital(); };
+    host.append(b);
+    if (state.acc === p.i && p.i >= 0) {
+      const hs = C.hold.filter(h => h[4] === p.i);
+      if (p.native[1] !== state.cur) host.append(el("div", "note", "В валюте счёта: " + fmtNative(p.native[0], p.native[1])));
+      hs.forEach(h => { const r = el("div", "hold"); const pnl = h[2] - h[3];
+        const left = el("div"); left.append(el("div", null, h[0]), el("div", "q", `${h[1]} шт × ${h[5]} ${h[6] || ""}`));
+        r.append(left, el("div", "a", fmt(h[2])), el("span", "pill " + (pnl >= 0 ? "good" : "bad"),
+          (pnl >= 0 ? "▲ " : "▼ ") + (h[3] ? Math.abs(pnl * 100 / h[3]).toFixed(1) : "0") + "%")); host.append(r); });
+      if (!hs.length) host.append(el("div", "note", "Позиций нет."));
+    }
+  });
+  renderLine(C.hist.map(h => [h[0], h[1]]).concat([[0, total]]));
+  $("c-note").textContent = "Оценка по последним известным ценам и курсам. Стоимость капитала бот сохраняет раз в день.";
+}
+$("c-line-table").onclick = () => { const t = $("c-line-tab"), c = $("c-line"); t.hidden = !t.hidden; c.hidden = !t.hidden;
+  $("c-line-table").textContent = t.hidden ? "Таблица" : "График"; };
+function renderLine(points) {
+  const host = $("c-line");
+  const seen = new Map(); points.forEach(p => seen.set(p[0], p[1])); const pts = [...seen.entries()].sort((a, b) => a[0] - b[0]);
+  if (pts.length < 2) { host.replaceChildren(el("div", "empty", "График появится через пару дней.")); $("c-line-tab").replaceChildren(); return; }
+  const W = host.clientWidth || 340, H = 190, L = 44, B = 22, T = 10, NS = "http://www.w3.org/2000/svg";
+  const vals = pts.map(p => conv(p[1], state.cur));
+  let lo = Math.min(...vals), hi = Math.max(...vals); const span = Math.max(hi - lo, Math.abs(hi) * .04, 1000);
+  const mid = (hi + lo) / 2; lo = mid - span * .62; hi = mid + span * .62;
+  const x0 = pts[0][0], x1 = pts[pts.length - 1][0];
+  const X = d => L + (W - L) * (d - x0) / Math.max(x1 - x0, 1), Y = v => T + (H - B - T) * (1 - (v - lo) / (hi - lo));
+  const mk = (tag, attrs) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
+  const svg = mk("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img",
+    "aria-label": "Стоимость капитала: " + pts.map((p, i) => `${dayLabel(addDays(dayOf(D.today), p[0]))} ${fmt(p[1])}`).join(", ") });
+  for (let k = 0; k <= 2; k++) { const v = lo + (hi - lo) * k / 2, y = Y(v);
+    svg.append(mk("line", { x1: L, x2: W, y1: y, y2: y, stroke: k ? "var(--grid)" : "var(--base)" }));
+    const t = mk("text", { x: L - 6, y: y + 4, "text-anchor": "end" });
+    t.textContent = Math.abs(v / 100) >= 10000 ? (v / 100000).toFixed(1).replace(".0", "") + "K" : Math.round(v / 100).toLocaleString("ru-RU"); svg.append(t); }
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${X(p[0]).toFixed(1)},${Y(vals[i]).toFixed(1)}`).join(" ");
+  svg.append(mk("path", { d: `${d} L${X(x1)},${H - B} L${X(x0)},${H - B} Z`, fill: "var(--accent)", opacity: .1 }));
+  svg.append(mk("path", { d, fill: "none", stroke: "var(--accent)", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  const end = mk("circle", { cx: X(x1), cy: Y(vals[vals.length - 1]), r: 4.5, fill: "var(--accent)", stroke: "var(--surface)", "stroke-width": 2 });
+  const cross = mk("line", { y1: T, y2: H - B, stroke: "var(--ink-2)", "stroke-width": 1, opacity: 0 });
+  const dot = mk("circle", { r: 4.5, fill: "var(--accent)", stroke: "var(--surface)", "stroke-width": 2, opacity: 0 });
+  svg.append(cross, end, dot);
+  [[x0, "start"], [x1, "end"]].forEach(([dd, anchor]) => { const t = mk("text", { x: X(dd), y: H - 6, "text-anchor": anchor });
+    t.textContent = dayLabel(addDays(dayOf(D.today), dd)); svg.append(t); });
+  const hit = mk("rect", { x: L, y: 0, width: W - L, height: H, fill: "transparent" });
+  const move = ev => { const r = svg.getBoundingClientRect(); const px = (ev.clientX - r.left) * W / r.width;
+    let best = 0; pts.forEach((p, i) => { if (Math.abs(X(p[0]) - px) < Math.abs(X(pts[best][0]) - px)) best = i; });
+    const cx = X(pts[best][0]), cy = Y(vals[best]);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("opacity", .5);
+    dot.setAttribute("cx", cx); dot.setAttribute("cy", cy); dot.setAttribute("opacity", 1);
+    showTip(r.left + cx * r.width / W, r.top + cy * r.height / H, fmt(pts[best][1]) + " " + state.cur, dayLabel(addDays(dayOf(D.today), pts[best][0]))); };
+  hit.addEventListener("pointermove", move); hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); dot.setAttribute("opacity", 0); hideTip(); });
+  svg.append(hit); host.replaceChildren(svg);
+  const table = el("table"); const head = el("tr"); head.append(el("th", null, "Дата"), el("th", null, state.cur)); table.append(head);
+  pts.slice().reverse().forEach(p => { const tr = el("tr"); tr.append(el("td", null, dayLabel(addDays(dayOf(D.today), p[0]))), el("td", null, fmt(p[1]))); table.append(tr); });
+  $("c-line-tab").replaceChildren(table);
+}
+
+// ------------------------------------------------------------------ shell
+function setTab(t) { state.tab = t; $("t-spend").setAttribute("aria-pressed", t === "spend"); $("t-cap").setAttribute("aria-pressed", t === "cap");
+  $("spend").hidden = t !== "spend"; $("capital").hidden = t !== "cap"; render(); }
+$("t-spend").onclick = () => { haptic(); setTab("spend"); };
+$("t-cap").onclick = () => { haptic(); setTab("cap"); };
+function render() { hideTip(); renderFilters(); if (state.tab === "spend") renderSpend(); else renderCapital(); }
+function applyTheme() {
+  const dark = TG && TG.colorScheme ? TG.colorScheme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  try { const bg = getComputedStyle(document.documentElement).getPropertyValue("--page").trim();
+    TG && TG.setHeaderColor(bg); TG && TG.setBackgroundColor(bg); } catch (e) {}
+}
+addEventListener("resize", () => render());
+(async function main() {
+  applyTheme(); if (TG) { TG.ready(); TG.expand(); TG.onEvent("themeChanged", () => { applyTheme(); render(); }); }
+  D = await load();
+  state.cur = D.cur in D.fx || D.cur === "USD" ? D.cur : "USD"; if (!D.fx.USD) D.fx.USD = 1;
+  if (param("tab") === "cap") state.tab = "cap";
+  $("foot").textContent = D.demo ? "Демо-данные. Откройте из бота, чтобы увидеть свои." :
+    `Данные на ${dayLabel(dayOf(D.today))} · суммы в других валютах — по текущему курсу`;
+  setTab(state.tab);
+})();
+
+// ------------------------------------------------------------------ demo data (opened outside Telegram)
+function demo() {
+  const today = new Date(); const t = new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()));
+  const start = new Date(Date.UTC(t.getUTCFullYear(), t.getUTCMonth() - 5, 1));
+  const cats = ["Продукты","Кафе и рестораны","Транспорт","Жильё","Учёба","Здоровье","Покупки","Подписки","Развлечения","Подарки","Работа","Переводы","Прочее"];
+  const ds = ["Carrefour", "кофе", "такси", "аренда", "учебник", "аптека", "кроссовки", "Netflix", "кино", "подарок маме", "обед"];
+  const pick = [[0, 0, 4000, 18000], [1, 1, 1500, 3000], [2, 2, 2000, 6000], [4, 4, 6000, 15000], [5, 5, 3000, 12000],
+                [6, 6, 20000, 42000], [8, 8, 5000, 8000], [9, 9, 10000, 30000], [1, 10, 3500, 9000]];
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const tx = []; const days = diffDays(t, start);
+  for (let d = 0; d <= days; d++) { const n = 1 + Math.floor(rnd() * 3);
+    for (let j = 0; j < n; j++) { const p = pick[Math.floor(rnd() * pick.length)]; const aed = p[2] + rnd() * (p[3] - p[2]);
+      tx.push([d, p[0], Math.round(aed / 3.6725), 0, p[1]]); }
+    const dt = addDays(start, d); if (dt.getUTCDate() === 1) tx.push([d, 3, Math.round(450000 / 3.6725), 0, 3]);
+    if (dt.getUTCDate() === 25) tx.push([d, 10, Math.round(650000 / 3.6725), 1, 10]); }
+  tx.push([days, 2, 1000, 0, 2, 0, 500000]);
+  const hist = []; for (let d = -120; d < 0; d += 4) hist.push([d, Math.round(1977000 + d * 900 + Math.sin(d / 9) * 15000)]);
+  return { demo: true, v: 1, today: iso(t), start: iso(start), cur: "AED", cs: ["AED", "USD", "KZT"], fx: { USD: 1, AED: 3.6725, KZT: 512 },
+    cats, col: { "Продукты": 0, "Кафе и рестораны": 1, "Транспорт": 2, "Жильё": 3, "Покупки": 4, "Здоровье": 5, "Учёба": 6, "Развлечения": 7 },
+    tx, ds, oc: ["KZT"], budget: Math.round(900000 / 3.6725), limits: { "Кафе и рестораны": Math.round(50000 / 3.6725) },
+    pay: { day: iso(addDays(t, 13)), perDay: 6300, free: 82000 },
+    cap: { acc: [["Брокерский счёт", "broker", 96820, 88000, "USD", 96820, 0, null], ["Депозит Kaspi", "deposit", 201992, 195312, "KZT", 101561644, 1, 15],
+      ["Крипта", "crypto", 67700, 62000, "USD", 67700, 2, null], ["Машина", "asset", 1500000, 1500000, "USD", 1500000, 3, null]],
+      hold: [["KSPI", "10", 86000, 80000, 0, 86, "USD"], ["AAPL", "0.5", 10520, 9000, 0, 210.4, "USD"], ["BTC", "0.01", 67700, 62000, 2, 67700, "USD"]],
+      wallet: [["AED", 300000, 81688], ["KZT", 15120000, 29531]], walletColor: 4, hist } };
+}
+</script>
+</body>
+</html>

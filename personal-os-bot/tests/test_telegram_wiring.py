@@ -83,3 +83,17 @@ def test_full_flow(svc, tmp_path):
     assert edits and edits[0].text.startswith("↩️ Отменено")
     assert any(isinstance(c, AnswerCallbackQuery) for c in session.calls)
     assert svc.db.scalar("SELECT COUNT(*) FROM transactions") == 0
+
+
+def test_stats_sends_photo(svc, tmp_path):
+    from aiogram.methods import SendPhoto
+    bot, dp, session = make(svc, tmp_path)
+    svc.process_text("Кофе 18", 1)
+
+    async def go():
+        await dp.feed_update(bot, msg_update(OWNER, "/stats", 2, 2))
+
+    asyncio.run(go())
+    photos = [c for c in session.calls if isinstance(c, SendPhoto)]
+    assert len(photos) == 1 and photos[0].caption.startswith("📊")
+    assert photos[0].reply_markup.inline_keyboard[0][1].callback_data == "st:m"

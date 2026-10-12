@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 
@@ -33,7 +34,12 @@ def main() -> int:
         log.error("BOT_TOKEN is not set. Copy .env.example to .env and fill it in.")
         return 1
     db = DB(cfg.db_path)
-    service = Service(db, default_tz=cfg.timezone)
+    from . import ai
+
+    ai_cfg = ai.config_from_env(dict(os.environ))
+    client = ai.AIClient(ai_cfg) if ai_cfg else None
+    log.info("AI: %s", f"{ai_cfg.provider} / {ai_cfg.model}" if ai_cfg else "off (rules only)")
+    service = Service(db, default_tz=cfg.timezone, ai=client)
     log.info("starting Personal OS, db=%s, owner=%s", cfg.db_path, cfg.owner_id)
     from .telegram_app import run
 

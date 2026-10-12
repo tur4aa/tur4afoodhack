@@ -9,7 +9,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (BotCommand, BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup)
+                           InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup)
 
 from .backup import make_backup
 from .config import Config
@@ -28,6 +28,7 @@ COMMANDS = [
     BotCommand(command="today", description="Дела на сегодня"),
     BotCommand(command="tasks", description="Задачи"),
     BotCommand(command="money", description="Финансовая сводка"),
+    BotCommand(command="stats", description="Аналитика картинкой"),
     BotCommand(command="calendar", description="Календарь"),
     BotCommand(command="inbox", description="Неразобранное"),
     BotCommand(command="settings", description="Настройки"),
@@ -45,6 +46,8 @@ HELP = """Пишите обычным текстом — я разберусь:
 🗓 «В четверг пара в 8:30» · «Смена с 22 до 6 в субботу»
 ☑️ «Купил продукты» — закрою подходящую задачу
 📝 «Заметка: …» — просто заметка
+📊 /stats — красивый отчёт картинкой (неделя, месяц, полгода)
+🤖 Если подключён бесплатный AI: можно пересылать SMS банка, вставлять списки и присылать фото чеков
 
 Исправить: кнопка «Изменить», «не 18, а 20» или отредактируйте своё сообщение.
 Отменить: кнопка «Отменить» или /undo.
@@ -75,6 +78,11 @@ def chunks(text: str) -> list[str]:
 
 
 async def send(bot: Bot, chat_id: int, reply: Reply) -> None:
+    if reply.photo:
+        name, data = reply.photo
+        await bot.send_photo(chat_id, BufferedInputFile(data, filename=name), caption=reply.text[:1000],
+                             reply_markup=keyboard(reply))
+        return
     if reply.document:
         name, data = reply.document
         await bot.send_document(chat_id, BufferedInputFile(data, filename=name), caption=reply.text[:1000])
@@ -142,36 +150,61 @@ def build_router(service: Service, cfg: Config) -> Router:
     async def menu(message: Message):
         await answer(message, views[MENU[message.text]]())
 
+    @r.message(Command("stats"))
+    async def stats(message: Message):
+        await message.bot.send_chat_action(message.chat.id, "upload_photo")
+        await answer(message, await asyncio.to_thread(service.analytics, "m"))
+
     @r.message(F.text)
     async def text(message: Message):
-        await answer(message, service.process_text(message.text, message.message_id))
+        # worker thread: a slow AI request must not block reminders or other updates
+        await answer(message, await asyncio.to_thread(service.process_text, message.text, message.message_id))
+
+    async def image_message(message: Message, file_id: str, mime: str = "image/jpeg"):
+        await message.bot.send_chat_action(message.chat.id, "typing")
+        buf = await message.bot.download(file_id)
+        reply = await asyncio.to_thread(service.process_photo, buf.read(), message.caption or "", message.message_id)
+        await answer(message, reply)
+
+    @r.message(F.photo)
+    async def photo(message: Message):
+        await image_message(message, message.photo[-1].file_id)
+
+    @r.message(F.document.mime_type.startswith("image/"))
+    async def image_file(message: Message):
+        await image_message(message, message.document.file_id, message.document.mime_type)
 
     @r.edited_message(F.text)
     async def edited(message: Message):
-        reply = service.process_edit(message.text, message.message_id)
+        reply = await asyncio.to_thread(service.process_edit, message.text, message.message_id)
         if reply is None:
             reply = Reply("Изменение получено, но это сообщение ничего не создавало — "
                           "отправьте исправленный текст новым сообщением.")
         await answer(message, reply)
 
-    @r.message(F.caption)
-    async def caption(message: Message):
-        await answer(message, service.process_text(message.caption, message.message_id))
-
     @r.message()
     async def other(message: Message):
-        await message.answer("Я понимаю только текст. Голосовые и файлы не обрабатываю.")
+        await message.answer("Я понимаю текст и фото. Голосовые и другие файлы не обрабатываю.")
 
     @r.callback_query()
     async def callback(cb: CallbackQuery):
-        reply = service.handle_callback(cb.data or "")
+        reply = await asyncio.to_thread(service.handle_callback, cb.data or "")
         try:
             await cb.answer(reply.toast or None)
         except TelegramBadRequest:
             pass  # callback too old
         if cb.message is None:
             return
-        if reply.edit and not reply.document:
+        if reply.edit and reply.photo and cb.message.photo:
+            name, data = reply.photo
+            try:
+                await cb.message.edit_media(
+                    InputMediaPhoto(media=BufferedInputFile(data, filename=name), caption=reply.text[:1000]),
+                    reply_markup=keyboard(reply))
+                return
+            except TelegramBadRequest as e:
+                log.info("edit_media failed (%s), sending new photo", e)
+        elif reply.edit and not reply.document and not reply.photo:
             try:
                 await cb.message.edit_text(reply.text[:TG_LIMIT], reply_markup=keyboard(reply))
                 return

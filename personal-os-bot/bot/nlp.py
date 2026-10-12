@@ -337,6 +337,7 @@ class Intent:
     candidates: list[Decimal] = field(default_factory=list)
     amount: Decimal | None = None
     ambiguous_dates: list[date] = field(default_factory=list)
+    low_confidence: bool = False  # rules found something, but a smarter parser may do better
 
 
 def _strip_lead(text: str) -> str:
@@ -426,6 +427,14 @@ def _money_intent(raw: str, ti: TimeInfo, amounts: list[Amount], now: datetime, 
             sti = timeparse.parse(seg, now, prefer_future=False)
             samounts = find_amounts(sti.remaining)
             parsed.append((seg, sti, samounts))
+        # "лекарства 85, а завтра к врачу к 10" - money mixed with a plan: don't guess
+        for seg, sti, samounts in parsed:
+            if not samounts:
+                fti = timeparse.parse(seg, now)
+                rest = fti.remaining
+                if fti.time is not None or (fti.date is not None and fti.date > today) or \
+                        is_task_verb(first_word(rest)) or EVENT_RE.search(rest):
+                    return Intent("complex", raw)
         if all(len(a) == 1 for _, _, a in parsed):
             common_date = next((p[1].date for p in parsed if p[1].date), None)
             fallback_type = None
@@ -441,8 +450,9 @@ def _money_intent(raw: str, ti: TimeInfo, amounts: list[Amount], now: datetime, 
     if len(amounts) == 1:
         if amounts[0].value <= 0:
             return Intent("ask_amount", raw, time=ti)
-        return Intent("money", raw, items=[build_money_item(ti.remaining, amounts[0], ti, currency, today, memory)],
-                      time=ti)
+        item = build_money_item(ti.remaining, amounts[0], ti, currency, today, memory)
+        words = [w for w in re.findall(r"[^\W\d]+", item.description, F) if w.lower() not in STOPWORDS]
+        return Intent("money", raw, items=[item], time=ti, low_confidence=len(words) > 5)
     return Intent("ask_amount", raw, time=ti, candidates=[a.value for a in amounts])
 
 

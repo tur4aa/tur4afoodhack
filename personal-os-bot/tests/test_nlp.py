@@ -113,3 +113,16 @@ def test_find_amounts_variants():
     assert [a.value for a in find_amounts("6.5k")] == [Decimal("6500")]
     assert [a.value for a in find_amounts("1 250 и 30")] == [Decimal(1250), Decimal(30)]
     assert find_amounts("в 8:30") == []
+
+
+def test_mixed_money_and_plan_is_not_guessed():
+    assert classify("вчера такси тридцатка, лекарства 85, а завтра к врачу к 10 утра", NOW).kind == "complex"
+    # but a description without a plan is fine
+    [item] = money("Купил продукты, молоко за 50")
+    assert item.amount == Decimal(50)
+
+
+def test_long_money_message_is_low_confidence():
+    i = classify("Purchase of AED 45.50 at CARREFOUR with card ending 1234. Avl bal AED 2,300.00", NOW)
+    assert i.kind == "money" and i.low_confidence
+    assert not classify("Кофе 18", NOW).low_confidence

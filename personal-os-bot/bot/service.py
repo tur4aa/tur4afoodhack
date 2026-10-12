@@ -36,6 +36,8 @@ DEFAULTS = {
     "evening_time": "21:30",
     "default_remind_time": "09:00",
     "event_remind_min": "30",
+    "ai_enabled": "1",
+    "monthly_report": "1",
 }
 
 OPEN_STATUSES = ("new", "in_progress", "waiting")
@@ -53,6 +55,7 @@ class Reply:
     buttons: Buttons = field(default_factory=list)
     edit: bool = False  # for callbacks: replace the original message
     document: tuple[str, bytes] | None = None
+    photo: tuple[str, bytes] | None = None
     toast: str | None = None
     show_menu: bool = False
 
@@ -64,9 +67,11 @@ class Notification:
 
 
 class Service:
-    def __init__(self, db: DB, clock: Callable[[], datetime] = utcnow, default_tz: str | None = None):
+    def __init__(self, db: DB, clock: Callable[[], datetime] = utcnow, default_tz: str | None = None,
+                 ai=None):
         self.db = db
         self.clock = clock  # naive UTC
+        self.ai = ai        # optional ai.AIClient; None = rules only
         with db.tx():
             for k, v in DEFAULTS.items():
                 if k == "timezone" and default_tz:
@@ -232,6 +237,24 @@ class Service:
         intent = nlp.classify(text, self.now_local(), self.currency, self._memory(), tomorrow_date)
         if intent.ambiguous_dates:
             return self._ask_date(text, intent.ambiguous_dates, msg_id)
+        ai_note = ""
+        if intent.kind == "complex":
+            ai_reply, ai_note = self._try_ai(text, msg_id)
+            if ai_reply is not None:
+                return ai_reply
+            return self._to_inbox(text, msg_id, prefix=(ai_note + " " if ai_note else "") +
+                                  "Тут несколько разных дел — отправьте их отдельными сообщениями или разберите:")
+        if intent.kind == "money" and intent.low_confidence and self.ai_active:
+            ai_reply, _ = self._try_ai(text, msg_id)   # e.g. a forwarded bank SMS; rules stay the fallback
+            if ai_reply is not None:
+                return ai_reply
+        if intent.kind == "unknown" or (intent.kind == "ask_amount" and intent.candidates):
+            # the rules gave up - let the (optional) AI try before asking / filing to Inbox
+            ai_reply, ai_note = self._try_ai(text, msg_id)
+            if ai_reply is not None:
+                return ai_reply
+            if intent.kind == "unknown":
+                return self._to_inbox(text, msg_id, prefix=ai_note)
         handler = {
             "money": self._h_money,
             "ask_amount": self._h_ask_amount,
@@ -244,6 +267,125 @@ class Service:
             "correction": self._h_correction,
         }.get(intent.kind, self._h_unknown)
         return handler(intent, msg_id, skip_dup=skip_dup)
+
+    # ------------------------------------------------------------ AI (optional)
+    @property
+    def ai_active(self) -> bool:
+        return self.ai is not None and self.db.get_setting("ai_enabled", "1") == "1"
+
+    def _ai_ctx(self) -> dict:
+        return {"now": self.now_local(), "tz": self.tz.key, "currency": self.currency, "categories": CATEGORIES}
+
+    def _try_ai(self, text: str, msg_id: int | None, image: bytes | None = None) -> tuple[Reply | None, str]:
+        """Ask the AI. Returns (reply, note). reply is None when nothing was saved."""
+        from .ai import AIError, validate
+
+        if not self.ai_active:
+            return None, ""
+        try:
+            data = self.ai.parse_image(image, text, self._ai_ctx()) if image is not None \
+                else self.ai.parse_text(text, self._ai_ctx())
+        except AIError as e:
+            log.warning("AI failed: %s", e)
+            return None, f"🤖 AI недоступен ({e})."
+        except Exception:
+            log.exception("AI crashed")
+            return None, "🤖 AI недоступен."
+        items, question = validate(data, self.today(), CATEGORIES)
+        if not items:
+            return None, (f"🤖 {question}" if question else "🤖 AI тоже не понял.")
+        try:
+            return self._apply_ai(items, msg_id), ""
+        except Exception as exc:  # nothing partial is kept: the whole batch is one transaction
+            log.exception("could not apply AI result")
+            return None, f"🤖 Не смог сохранить разбор AI ({type(exc).__name__})."
+
+    def _apply_ai(self, items, msg_id: int | None) -> Reply:
+        replies: list[Reply] = []
+        with self.db.tx():
+            before = self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM actions")
+            money = []
+            for it in items:
+                if it.type in ("expense", "income", "refund", "transfer"):
+                    desc = it.description or it.title
+                    cat = it.category or nlp.guess_category(desc, self._memory())[0]
+                    if it.type == "transfer":
+                        cat = "Переводы"
+                    d = it.date if it.date and it.date <= self.today() + timedelta(days=1) else self.today()
+                    money.append(MoneyItem(it.type, Decimal(str(round(it.amount, 2))), it.currency or self.currency,
+                                           cat, desc, d))
+            if money:
+                replies.append(self._save_money(money, msg_id, skip_dup=True))
+            for it in items:
+                if it.type in ("expense", "income", "refund", "transfer"):
+                    continue
+                title = fmt.cap(it.title)
+                t = time(*it.time) if it.time else None
+                if it.type == "note":
+                    replies.append(self._h_note(Intent("note", title=title), msg_id))
+                elif it.recurrence:
+                    ti = TimeInfo(date=it.date, time=t, recurrence=it.recurrence,
+                                  rec_day=it.date.day if it.date and it.recurrence == "monthly" else None)
+                    replies.append(self._create_recurring_reminder(title, ti, msg_id))
+                elif it.type == "event" and it.date is not None:
+                    ti = TimeInfo(date=it.date, time=t, found=True)
+                    if t is not None and it.end_time:
+                        ti.end_time = time(*it.end_time)
+                        ti.end_date = it.end_date or (it.date + timedelta(days=1) if ti.end_time <= t else it.date)
+                    replies.append(self._h_event(Intent("event", title=title, time=ti), msg_id))
+                else:
+                    d = it.date
+                    if d is None and t is not None:
+                        now = self.now_local()
+                        d = now.date() if datetime.combine(now.date(), t) > now else now.date() + timedelta(days=1)
+                    if it.type == "reminder" and d is not None and t is None:
+                        t = self._setting_time("default_remind_time")
+                    local = datetime.combine(d, t) if d and t else None
+                    replies.append(self._create_task(title, d, local, it.deadline, msg_id))
+            ids = [r["id"] for r in self.db.all("SELECT id FROM actions WHERE id > ? ORDER BY id", (before,))]
+            aid = self._merge_actions(ids, "разбор AI")
+        lines = [r.text for r in replies]
+        buttons: Buttons = []
+        if aid:
+            buttons.append([("Отменить всё", f"u:{aid}")])
+        tx_buttons = [b for r in replies for row in r.buttons for b in row if b[1].startswith("tx:e:")]
+        if len(tx_buttons) == 1:
+            buttons[0].append(("Изменить", tx_buttons[0][1]))
+        elif tx_buttons:
+            buttons.append(tx_buttons[:8])
+        return Reply("🤖 " + "\n".join(lines), buttons)
+
+    def _merge_actions(self, ids: list[int], description: str) -> int | None:
+        """Fold several actions into one, so a single "Отменить" reverts them all."""
+        if not ids:
+            return None
+        if len(ids) == 1:
+            return ids[0]
+        merged = {"created": [], "updated": [], "deleted": []}
+        for aid in ids:
+            p = json.loads(self.db.scalar("SELECT payload FROM actions WHERE id = ?", (aid,)))
+            for k in merged:
+                merged[k] += p[k]
+        self.db.execute("UPDATE actions SET payload = ?, description = ? WHERE id = ?",
+                        (json.dumps(merged, ensure_ascii=False), description, ids[0]))
+        self.db.execute(f"DELETE FROM actions WHERE id IN ({','.join('?' * (len(ids) - 1))})", ids[1:])
+        return ids[0]
+
+    def process_photo(self, image: bytes, caption: str, msg_id: int | None) -> Reply | None:
+        if msg_id is not None and self.db.scalar("SELECT 1 FROM processed_messages WHERE message_id = ?", (msg_id,)):
+            return None
+        if not self.ai_active:
+            reply = Reply("Фото (чеки, SMS, скриншоты) я понимаю только с подключённым AI — "
+                          "это бесплатно, см. README → «Бесплатный AI»." if self.ai is None else
+                          "AI выключен в /settings — включите, чтобы я разбирал фото.")
+        else:
+            reply, note = self._try_ai(caption or "", msg_id, image=image)
+            if reply is None:
+                reply = Reply(f"{note}\nНе смог разобрать фото. Напишите текстом, например «Carrefour 120».")
+        if msg_id is not None:
+            self.db.execute("INSERT OR IGNORE INTO processed_messages(message_id, created_at) VALUES (?, ?)",
+                            (msg_id, fmt_utc(self.now_utc())))
+        return reply
 
     # ------------------------------------------------------------ money
     def _insert_tx(self, item: MoneyItem, msg_id: int | None) -> int:
@@ -761,10 +903,12 @@ class Service:
         head = (prefix + " " if prefix else "") + "📥 Сохранил в Inbox. Что это?"
         return Reply(head, self._inbox_buttons(iid))
 
-    @staticmethod
-    def _inbox_buttons(iid: int) -> Buttons:
-        return [[("Задача", f"ib:{iid}:t"), ("Расход", f"ib:{iid}:m"), ("Напоминание", f"ib:{iid}:r")],
+    def _inbox_buttons(self, iid: int) -> Buttons:
+        rows = [[("Задача", f"ib:{iid}:t"), ("Расход", f"ib:{iid}:m"), ("Напоминание", f"ib:{iid}:r")],
                 [("Заметка", f"ib:{iid}:n"), ("Удалить", f"ib:{iid}:x")]]
+        if self.ai_active:
+            rows[1].insert(0, ("🤖 Разобрать", f"ib:{iid}:ai"))
+        return rows
 
     def _inbox_convert(self, iid: int, kind: str) -> Reply:
         item = self.db.get("inbox", iid)
@@ -780,6 +924,11 @@ class Service:
                 reply.buttons = reply.buttons + nxt.buttons
             return reply
 
+        if kind == "ai":
+            reply, note = self._try_ai(text, item["source_msg_id"])
+            if reply is None:
+                return Reply(f"{note}\nОставил в Inbox.", self._inbox_buttons(iid))
+            return done(reply)
         if kind == "x":
             with self.db.tx():
                 upd = self._update("inbox", iid, {"status": "deleted"})
@@ -1335,7 +1484,7 @@ class Service:
             for r in recent:
                 d = date.fromisoformat(r["occurred_on"])
                 lines.append(f"{d.strftime('%d.%m')} {self._tx_line(dict(r), show_date=False)}")
-        buttons = [[("Последние 20", "money:recent"), ("Настройки денег", "money:help")]]
+        buttons = [[("📊 Аналитика", "st:m"), ("Последние 20", "money:recent")], [("Настройки денег", "money:help")]]
         return Reply("\n".join(lines), buttons)
 
     def view_recent_tx(self) -> Reply:
@@ -1428,6 +1577,9 @@ class Service:
             f"День зарплаты: {g('payday_day') or '—'}",
             f"Ожидаемая зарплата: {fmt.money(int(salary), cur) if salary else '—'}",
             f"Введённый остаток: {fmt.money(int(bal), cur) if bal else '—'}",
+            f"Отчёт-картинка за месяц 1-го числа: {onoff[g('monthly_report')]}",
+            "AI: " + (f"{onoff[g('ai_enabled')]} ({self.ai.cfg.provider}, {self.ai.cfg.model})" if self.ai is not None
+                      else "не подключён (см. README)"),
         ]
         pays = self.db.all("SELECT * FROM payments ORDER BY day_of_month")
         if pays:
@@ -1453,8 +1605,11 @@ class Service:
             [("Бюджет", "set:ask:monthly_budget"), ("День зарплаты", "set:ask:payday_day"),
              ("Сумма зарплаты", "set:ask:salary_amount")],
             [("Остаток", "set:ask:balance"), ("События: за N мин", "set:ask:event_remind_min")],
-            [("Платежи/резервы/лимиты", "set:list")],
-        ]
+            [("Платежи/резервы/лимиты", "set:list"),
+             (("📊 Отчёт 1-го: выкл" if g("monthly_report") == "1" else "📊 Отчёт 1-го: вкл"),
+              "set:tog:monthly_report")],
+        ] + ([[(("🤖 AI: выкл" if g("ai_enabled") == "1" else "🤖 AI: вкл"), "set:tog:ai_enabled")]]
+             if self.ai is not None else [])
 
     def view_settings(self) -> Reply:
         return Reply(self.settings_text(), self.settings_buttons())
@@ -1471,6 +1626,121 @@ class Service:
         if not rows:
             lines = ["Платежей, резервов и лимитов пока нет.", "", self.MONEY_HELP]
         return Reply("\n".join(lines), rows)
+
+    # ------------------------------------------------------------ analytics (images)
+    PERIODS = {"w": "Неделя", "m": "Месяц", "pm": "Прошлый месяц", "6": "Полгода"}
+
+    def _category_colors(self, ranked: list[str]) -> dict[str, int]:
+        """Permanent category -> palette slot. New categories take the next free slot (max 8)."""
+        colors: dict[str, int] = json.loads(self.db.get_setting("category_colors", "{}"))
+        changed = False
+        all_time = [r["category"] for r in self.db.all(
+            "SELECT category FROM transactions WHERE type = 'expense' GROUP BY category ORDER BY SUM(amount_minor) DESC")]
+        for name in all_time + ranked:
+            if name not in colors and name != nlp.OTHER and len(colors) < 8:
+                colors[name] = len(colors)
+                changed = True
+        if changed:
+            self.db.set_setting("category_colors", json.dumps(colors, ensure_ascii=False))
+        return colors
+
+    def analytics(self, period: str = "m") -> Reply:
+        from . import charts
+
+        today = self.today()
+        cur = self.currency
+        limits = {r["category"]: r["amount_minor"] for r in self.db.all("SELECT * FROM category_limits")}
+        month_names_gen = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+                           "сентября", "октября", "ноября", "декабря"]
+        bars: list[tuple[str, int, bool]] = []
+        reference = None
+        if period == "w":
+            start = today - timedelta(days=today.weekday())
+            end = today
+            prev_start, prev_end = start - timedelta(days=7), end - timedelta(days=7)
+            title = "Эта неделя"
+            subtitle = f"Расходы · {fmt.day(start)}" + (f" — {fmt.day(end)}" if end != start else "")
+            compare_label = "к прошлой неделе за те же дни"
+            for i in range(7):
+                d = start + timedelta(days=i)
+                bars.append((fmt.WD_SHORT[i], self._net_expense(d, d, cur) if d <= today else 0, d == today))
+            bars_title = "По дням"
+        elif period == "6":
+            first = add_months(today.replace(day=1), -5)
+            start, end = first, today
+            prev_start = prev_end = None
+            title = "Полгода"
+            subtitle = f"Расходы · {fmt.MONTHS_NOM[first.month - 1]} — {fmt.MONTHS_NOM[today.month - 1]}"
+            compare_label = None
+            for i in range(6):
+                ms = add_months(first, i, 1)
+                me = add_months(ms, 1, 1) - timedelta(days=1)
+                bars.append((fmt.MONTHS_SHORT[ms.month - 1], self._net_expense(ms, min(me, today), cur), i == 5))
+            bars_title = "По месяцам"
+        else:
+            if period == "pm":
+                end = today.replace(day=1) - timedelta(days=1)
+                start = end.replace(day=1)
+                prev_end = start - timedelta(days=1)
+                prev_start = prev_end.replace(day=1)
+                compare_label = f"к {fmt.MONTHS_DAT[prev_start.month - 1]}"
+            else:
+                start, end = today.replace(day=1), today
+                prev_start = add_months(start, -1, 1)
+                prev_end = min(add_months(start, -1, today.day), start - timedelta(days=1))
+                compare_label = "к прошлому месяцу за те же дни"
+            title = f"{fmt.cap(fmt.MONTHS_NOM[start.month - 1])} {start.year}"
+            subtitle = f"Расходы · {start.day}–{end.day} {month_names_gen[start.month - 1]}"
+            month_end = add_months(start, 1, 1) - timedelta(days=1)
+            d = start
+            while d <= month_end:
+                bars.append((str(d.day), self._net_expense(d, d, cur) if d <= end else 0, d == today))
+                d += timedelta(days=1)
+            bars_title = "По дням"
+            budget = self.db.get_setting("monthly_budget")
+            if budget:
+                reference = ("бюджет/день", int(budget) // month_end.day)
+        total = self._net_expense(start, end, cur)
+        compare_total = self._net_expense(prev_start, prev_end, cur) if prev_start else None
+        income = self._sum(("income",), start, end, cur)
+        rows = self.db.all(
+            "SELECT category, SUM(CASE WHEN type = 'expense' THEN amount_minor ELSE -amount_minor END) AS s "
+            "FROM transactions WHERE type IN ('expense','refund') AND occurred_on BETWEEN ? AND ? AND currency = ? "
+            "GROUP BY category HAVING s > 0 ORDER BY s DESC", (start.isoformat(), end.isoformat(), cur))
+        monthly_view = period in ("m", "pm")
+        categories = [charts.CategoryRow(r["category"], r["s"], limits.get(r["category"]) if monthly_view else None)
+                      for r in rows]
+        days = (end - start).days + 1
+        whole = lambda m: fmt.money(round(m / 100) * 100)  # noqa: E731 - tiles show whole units
+        kpis = [("Доходы", "+" + whole(income) if income else "0")]
+        if period == "6":
+            active_months = sum(1 for _, v, _ in bars if v > 0) or 1
+            kpis.append(("В среднем за месяц", whole(total // active_months)))
+        else:
+            kpis.append(("В среднем за день", whole(total // max(days, 1))))
+        allowance = self.daily_allowance() if period in ("m", "w") else None
+        if allowance is not None:
+            kpis.append(("Можно сегодня", whole(allowance)))
+        else:
+            n_tx = self.db.scalar("SELECT COUNT(*) FROM transactions WHERE type = 'expense' AND occurred_on "
+                                  "BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))
+            kpis.append(("Покупок", str(n_tx)))
+        top = [(date.fromisoformat(r["occurred_on"]).strftime("%d.%m"), r["description"] or r["category"],
+                r["amount_minor"]) for r in self.db.all(
+            "SELECT * FROM transactions WHERE type = 'expense' AND currency = ? AND occurred_on BETWEEN ? AND ? "
+            "ORDER BY amount_minor DESC LIMIT 3", (cur, start.isoformat(), end.isoformat()))]
+        rep = charts.Report(colors=self._category_colors([r.name for r in categories]), title=title, subtitle=subtitle, currency=cur, total=total, compare_label=compare_label,
+                            compare_total=compare_total, income=income, kpis=kpis, categories=categories,
+                            bars=bars, bars_title=bars_title, bar_reference=reference, top=top)
+        png = charts.render_report(rep)
+        # caption = the same numbers as text (works without seeing colors)
+        lines = [f"📊 {title}: {fmt.money(total, cur)}"]
+        if compare_total:
+            pct = round((total - compare_total) * 100 / compare_total)
+            lines[0] += f" ({'+' if pct > 0 else ''}{pct}% {compare_label})"
+        lines += [f"{r.name} — {fmt.money(r.amount)} ({r.amount * 100 // max(total, 1)}%)" for r in categories[:5]]
+        buttons = [[(("• " if k == period else "") + v, f"st:{k}") for k, v in self.PERIODS.items()]]
+        return Reply("\n".join(lines), buttons, photo=(f"report-{period}-{today.isoformat()}.png", png))
 
     # ------------------------------------------------------------ export
     def export(self) -> Reply:
@@ -1524,6 +1794,10 @@ class Service:
                 return self._cb_choice(parts[1], parts[2])
             if head == "set":
                 return self._cb_settings(parts)
+            if head == "st":
+                r = self.analytics(parts[1])
+                r.edit = True
+                return r
             if head == "pay":
                 return self._pay_payment(int(parts[1]))
             if head == "money":
@@ -1703,6 +1977,18 @@ class Service:
                 continue
             reply = self.morning_digest() if kind == "morning" else self.evening_digest()
             out.append(Notification(reply, lambda k=kind, d=today: self.db.set_setting(f"{k}_last", d)))
+        month = local.date().strftime("%Y-%m")
+        if (local.date().day == 1 and self.db.get_setting("monthly_report") == "1"
+                and self.db.get_setting("monthly_report_last") != month
+                and local.time() >= self._setting_time("morning_time")):
+            has_data = self.db.scalar("SELECT 1 FROM transactions WHERE occurred_on >= ? AND occurred_on < ? LIMIT 1",
+                                      (add_months(local.date(), -1, 1).isoformat(), local.date().isoformat()))
+            if has_data:
+                rep = self.analytics("pm")
+                rep.text = "📊 Итоги прошлого месяца\n" + rep.text
+                out.append(Notification(rep, lambda m=month: self.db.set_setting("monthly_report_last", m)))
+            else:
+                self.db.set_setting("monthly_report_last", month)
         return out
 
     def _reminders_message(self, due: list[dict]) -> Reply:

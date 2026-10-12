@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
@@ -148,6 +148,64 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     created_at TEXT NOT NULL
 );
 
+-- exchange rates: units of `code` per 1 USD (manual entries beat downloaded ones on the same day)
+CREATE TABLE IF NOT EXISTS rates (
+    code       TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    source     TEXT NOT NULL,          -- 'api' | 'manual'
+    per_usd    REAL NOT NULL CHECK (per_usd > 0),
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (code, day, source)
+);
+
+-- savings, brokerage, deposits, crypto wallets, other assets (car, gold...)
+CREATE TABLE IF NOT EXISTS accounts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid        TEXT NOT NULL UNIQUE,
+    name       TEXT NOT NULL UNIQUE,
+    kind       TEXT NOT NULL CHECK (kind IN ('savings','broker','deposit','crypto','asset','other')),
+    currency   TEXT NOT NULL,
+    rate_pct   REAL,                   -- deposit interest, % per year (estimate only)
+    created_at TEXT NOT NULL
+);
+
+-- every movement of money/assets outside everyday spending
+CREATE TABLE IF NOT EXISTS moves (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid           TEXT NOT NULL UNIQUE,
+    kind          TEXT NOT NULL CHECK (kind IN
+                  ('exchange','deposit','withdraw','buy','sell','dividend','interest','fee','value')),
+    account_id    INTEGER,             -- NULL for wallet currency exchange
+    from_currency TEXT,
+    from_minor    INTEGER,
+    to_currency   TEXT,
+    to_minor      INTEGER,
+    symbol        TEXT,                -- AAPL, BTC, ...
+    qty           REAL,
+    occurred_on   TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    source_msg_id INTEGER,
+    note          TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_moves_acc ON moves(account_id);
+
+CREATE TABLE IF NOT EXISTS prices (
+    symbol     TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    price      REAL NOT NULL CHECK (price > 0),
+    currency   TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (symbol, day)
+);
+
+-- daily net worth history (in USD) for the capital chart
+CREATE TABLE IF NOT EXISTS networth (
+    day    TEXT PRIMARY KEY,
+    usd    REAL NOT NULL,
+    detail TEXT NOT NULL DEFAULT '{}'
+);
+
 -- short-lived state: pending questions, awaited input
 CREATE TABLE IF NOT EXISTS kv (
     key        TEXT PRIMARY KEY,
@@ -159,6 +217,7 @@ CREATE TABLE IF NOT EXISTS kv (
 ALLOWED_TABLES = {
     "transactions", "tasks", "events", "reminders", "inbox", "notes",
     "payments", "reserves", "category_limits", "category_memory", "settings",
+    "accounts", "moves", "rates", "prices", "networth",
 }
 
 

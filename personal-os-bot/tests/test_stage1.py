@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 
 from bot.service import Service
+from tests.conftest import plain
 
 
 def tx_count(svc):
@@ -31,14 +32,14 @@ def test_income(svc, mid):
 def test_transfer_not_counted(svc, mid):
     svc.process_text("перевел 500 на сберегательный", mid())
     svc.process_text("кофе 20", mid())
-    money = svc.view_money().text
-    assert "Месяц: 20 AED" in money and "Доходы за месяц: +0 AED" in money
+    money = plain(svc.view_money().text)
+    assert "Месяц 20 AED" in money and "Доходы за месяц +0 AED" in money
 
 
 def test_refund_reduces_expenses(svc, mid):
     svc.process_text("кроссовки 300", mid())
     svc.process_text("возврат за кроссовки 100", mid())
-    assert "Сегодня: 200 AED" in svc.view_money().text
+    assert "Сегодня 200 AED" in plain(svc.view_money().text)
 
 
 def test_undo_button_and_command(svc, mid):
@@ -222,11 +223,11 @@ def test_money_summary(svc, mid, clock):
     svc.process_text("вчера такси 30", mid())  # Sunday 11 Oct - previous ISO week
     svc.process_text("Кофе 18", mid())
     svc.process_text("Получил зарплату 6500", mid())
-    m = svc.view_money().text
-    assert "Сегодня: 18 AED" in m
-    assert "Неделя: 18 AED" in m
-    assert "Месяц: 48 AED" in m
-    assert "Доходы за месяц: +6 500 AED" in m
+    m = plain(svc.view_money().text)
+    assert "Сегодня 18 AED" in m
+    assert "Неделя 18 AED" in m
+    assert "Месяц 48 AED" in m
+    assert "Доходы за месяц +6 500 AED" in m
     assert "Транспорт — 30 (62%)" in m
 
 
@@ -237,7 +238,7 @@ def test_budget_and_limit_warnings(svc, mid):
     assert "лимит превышен" in r.text
     r = svc.process_text("такси 35", mid())
     assert "Бюджет месяца" in r.text
-    assert "из 100 AED" in svc.view_money().text
+    assert "из 100 AED" in plain(svc.view_money().text)
 
 
 def test_unknown_goes_to_inbox_and_can_be_converted(svc, mid):

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
 from datetime import date
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -77,15 +79,36 @@ def chunks(text: str) -> list[str]:
     return out
 
 
+def strip_html(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def mode(reply: Reply) -> str | None:
+    return "HTML" if reply.html else None
+
+
 async def send(bot: Bot, chat_id: int, reply: Reply) -> None:
+    try:
+        await _send(bot, chat_id, reply)
+    except TelegramBadRequest as e:
+        if reply.html and "parse" in str(e).lower():
+            log.warning("HTML rejected (%s), sending as plain text", e)
+            reply.text, reply.html = strip_html(reply.text), False
+            await _send(bot, chat_id, reply)
+        else:
+            raise
+
+
+async def _send(bot: Bot, chat_id: int, reply: Reply) -> None:
     if reply.photo:
         name, data = reply.photo
         await bot.send_photo(chat_id, BufferedInputFile(data, filename=name), caption=reply.text[:1000],
-                             reply_markup=keyboard(reply))
+                             reply_markup=keyboard(reply), parse_mode=mode(reply))
         return
     if reply.document:
         name, data = reply.document
-        await bot.send_document(chat_id, BufferedInputFile(data, filename=name), caption=reply.text[:1000])
+        await bot.send_document(chat_id, BufferedInputFile(data, filename=name), caption=reply.text[:1000],
+                                parse_mode=mode(reply))
         return
     parts = chunks(reply.text)
     for i, part in enumerate(parts):
@@ -93,7 +116,7 @@ async def send(bot: Bot, chat_id: int, reply: Reply) -> None:
         markup = keyboard(reply) if last else None
         if last and markup is None and reply.show_menu:
             markup = MENU_KB
-        await bot.send_message(chat_id, part, reply_markup=markup)
+        await bot.send_message(chat_id, part, reply_markup=markup, parse_mode=mode(reply))
 
 
 class OwnerOnly(BaseMiddleware):
@@ -199,14 +222,15 @@ def build_router(service: Service, cfg: Config) -> Router:
             name, data = reply.photo
             try:
                 await cb.message.edit_media(
-                    InputMediaPhoto(media=BufferedInputFile(data, filename=name), caption=reply.text[:1000]),
+                    InputMediaPhoto(media=BufferedInputFile(data, filename=name), caption=reply.text[:1000],
+                                    parse_mode=mode(reply)),
                     reply_markup=keyboard(reply))
                 return
             except TelegramBadRequest as e:
                 log.info("edit_media failed (%s), sending new photo", e)
         elif reply.edit and not reply.document and not reply.photo:
             try:
-                await cb.message.edit_text(reply.text[:TG_LIMIT], reply_markup=keyboard(reply))
+                await cb.message.edit_text(reply.text[:TG_LIMIT], reply_markup=keyboard(reply), parse_mode=mode(reply))
                 return
             except TelegramBadRequest as e:
                 if "not modified" in str(e):

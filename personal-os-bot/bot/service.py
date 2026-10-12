@@ -5,6 +5,7 @@ All database changes that the user can see are recorded in ``actions`` so they c
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
 import logging
@@ -18,7 +19,8 @@ from typing import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import formatting as fmt
-from . import nlp, timeparse
+from . import capital, nlp, timeparse
+from .capital_service import CAPITAL_HELP, CapitalMixin
 from .db import DB, fmt_utc, new_uid, parse_utc, utcnow
 from .nlp import CATEGORIES, Intent, MoneyItem
 from .timeparse import TimeInfo, add_months, next_month_day
@@ -56,6 +58,7 @@ class Reply:
     edit: bool = False  # for callbacks: replace the original message
     document: tuple[str, bytes] | None = None
     photo: tuple[str, bytes] | None = None
+    html: bool = False      # text uses Telegram HTML (<b>, <i>); user content must be escaped
     toast: str | None = None
     show_menu: bool = False
 
@@ -66,12 +69,16 @@ class Notification:
     on_sent: Callable[[], None]
 
 
-class Service:
+class Service(CapitalMixin):
     def __init__(self, db: DB, clock: Callable[[], datetime] = utcnow, default_tz: str | None = None,
-                 ai=None):
+                 ai=None, fetch=None):
+        from .market import Market, http_get
+
         self.db = db
         self.clock = clock  # naive UTC
         self.ai = ai        # optional ai.AIClient; None = rules only
+        self.market = Market(db, fetch or http_get)
+        self._fx_missing: set[str] = set()
         with db.tx():
             for k, v in DEFAULTS.items():
                 if k == "timezone" and default_tz:
@@ -234,6 +241,14 @@ class Service:
         setting_reply = self._setting_command(text, msg_id)
         if setting_reply is not None:
             return setting_reply
+        low = text.strip().lower().rstrip("!.?")
+        if low in ("капитал", "инвестиции", "сбережения", "capital", "portfolio", "портфель"):
+            return self.view_capital()
+        if low in ("курс", "курсы", "курсы валют", "rates"):
+            return self.view_rates()
+        ci = capital.parse(text, self.currency, [a["name"] for a in self._accounts()])
+        if ci is not None:
+            return self._h_capital(ci, msg_id)
         intent = nlp.classify(text, self.now_local(), self.currency, self._memory(), tomorrow_date)
         if intent.ambiguous_dates:
             return self._ask_date(text, intent.ambiguous_dates, msg_id)
@@ -1064,7 +1079,7 @@ class Service:
                         self.db.set_setting(key, DEFAULTS[key])
                         return Reply(f"Сбросил «{key}» на значение по умолчанию: {DEFAULTS[key]}")
                     if key == "balance":
-                        for k in ("balance_minor", "balance_set_at", "balance_after_tx"):
+                        for k in ("balance_minor", "balance_set_at", "balance_after_tx", "balances"):
                             self.db.del_setting(k)
                     else:
                         self.db.del_setting(key)
@@ -1087,11 +1102,8 @@ class Service:
                 elif key in ("monthly_budget", "salary_amount"):
                     self.db.set_setting(key, fmt.to_minor(fmt.parse_amount_str(self._num(v))))
                 elif key == "balance":
-                    self.db.set_setting("balance_minor", fmt.to_minor(fmt.parse_amount_str(self._num(v))))
-                    self.db.set_setting("balance_set_at", fmt_utc(self.now_utc()))
-                    # operations recorded after this id change the calculated balance
-                    self.db.set_setting("balance_after_tx", self.db.scalar(
-                        "SELECT COALESCE(MAX(id), 0) FROM transactions"))
+                    cur = nlp.find_currency(v)[0] or self.currency
+                    self._set_balance(cur, fmt.to_minor(fmt.parse_amount_str(self._num(v))))
                 elif key == "payday_day":
                     d = int(self._num(v))
                     if not 1 <= d <= 31:
@@ -1131,11 +1143,17 @@ class Service:
                 self.db.execute("INSERT INTO category_limits(category, amount_minor) VALUES (?, ?) "
                                 "ON CONFLICT(category) DO UPDATE SET amount_minor = excluded.amount_minor", (cat, amount))
             return Reply(f"Лимит: {cat} — {fmt.money(amount, self.currency)} в месяц")
-        m = re.fullmatch(rf"(?:остаток|баланс|balance)\s+{num}", t, re.I)
+        m = re.fullmatch(rf"(?:остаток|баланс|balance)\s+{num}\s*(?P<cur>\S+)?", t, re.I)
         if m:
-            self._apply_setting("balance", m.group(1))
-            return Reply(f"Остаток записан: {fmt.money(int(self.db.get_setting('balance_minor')), self.currency)}. "
-                         "Дальше считаю расчётный остаток по записанным операциям.")
+            cur = nlp.find_currency(m.group("cur"))[0] if m.group("cur") else self.currency
+            if cur is None:
+                return Reply("Не понял валюту. Пример: «остаток 150000 тенге».")
+            minor = fmt.to_minor(fmt.parse_amount_str(self._num(m.group(1))))
+            with self.db.tx():
+                self._set_balance(cur, minor)
+            others = [fmt.money(v[1], c) for c, v in self._pockets().items() if c != cur]
+            return Reply(f"Остаток записан: {fmt.money(minor, cur)}" + (f" (ещё: {', '.join(others)})" if others else "")
+                         + ".\nДальше считаю расчётный остаток по записанным операциям.")
         m = re.fullmatch(r"(?:день\s+зарплаты|зарплата|зп|payday)\s+(\d{1,2})(?:-?го|-?е)?(?:\s+числа)?", t, re.I)
         if m:
             r = self._apply_setting("payday_day", m.group(1))
@@ -1243,50 +1261,128 @@ class Service:
             aid = self._action(f"оплата «{p['name']}»", created=[("transactions", tx_id)], updated=[upd])
         return Reply(f"💳 Оплачено: {self._tx_line(self.db.get('transactions', tx_id))}", [[("Отменить", f"u:{aid}")]])
 
-    # ------------------------------------------------------------ money queries
-    def _sum(self, types: tuple[str, ...], start: date, end: date, currency: str, category: str | None = None) -> int:
-        q = (f"SELECT COALESCE(SUM(amount_minor), 0) FROM transactions WHERE type IN ({','.join('?' * len(types))}) "
-             "AND occurred_on BETWEEN ? AND ? AND currency = ?")
-        params: list = [*types, start.isoformat(), end.isoformat(), currency]
+    # ------------------------------------------------------------ money queries (multi-currency)
+    @property
+    def report_currency(self) -> str:
+        return self.db.get_setting("report_currency") or self.currency
+
+    @property
+    def tracked_currencies(self) -> list[str]:
+        return [c.strip().upper() for c in self.db.get_setting("currencies", "AED,USD,KZT").split(",") if c.strip()]
+
+    def _conv(self, minor: int, frm: str, to: str, day: date | None = None) -> int | None:
+        v = self.market.convert(minor, frm, to, day or self.today())
+        if v is None:
+            self._fx_missing.add(frm.upper() if self.market.per_usd(frm, day or self.today()) is None else to.upper())
+        return v
+
+    def _tx_rows(self, types: tuple[str, ...], start: date, end: date, category: str | None = None) -> list:
+        q = (f"SELECT * FROM transactions WHERE type IN ({','.join('?' * len(types))}) "
+             "AND occurred_on BETWEEN ? AND ?")
+        params: list = [*types, start.isoformat(), end.isoformat()]
         if category:
             q += " AND category = ?"
             params.append(category)
-        return int(self.db.scalar(q, params))
+        return self.db.all(q, params)
+
+    def _sum(self, types: tuple[str, ...], start: date, end: date, currency: str, category: str | None = None) -> int:
+        """Sum in ``currency``; each operation converted at the rate of its own date."""
+        total = 0
+        for r in self._tx_rows(types, start, end, category):
+            v = self._conv(r["amount_minor"], r["currency"], currency, date.fromisoformat(r["occurred_on"]))
+            total += v or 0
+        return total
 
     def _net_expense(self, start: date, end: date, currency: str, category: str | None = None) -> int:
         return self._sum(("expense",), start, end, currency, category) - \
             self._sum(("refund",), start, end, currency, category)
 
-    def _calculated_balance(self) -> tuple[int, int, datetime] | None:
-        base = self.db.get_setting("balance_minor")
-        set_at = self.db.get_setting("balance_set_at")
-        if base is None or set_at is None:
-            return None
-        cur = self.currency
-        row = self.db.one(
-            "SELECT COALESCE(SUM(CASE WHEN type IN ('income','refund') THEN amount_minor "
-            "WHEN type = 'expense' THEN -amount_minor ELSE 0 END), 0) FROM transactions "
-            "WHERE id > ? AND currency = ?", (int(self.db.get_setting("balance_after_tx", "0")), cur))
-        return int(base), int(base) + int(row[0]), parse_utc(set_at).replace(tzinfo=None)
+    def _by_category(self, start: date, end: date, currency: str) -> list[tuple[str, int]]:
+        acc: dict[str, int] = {}
+        for r in self._tx_rows(("expense", "refund"), start, end):
+            v = self._conv(r["amount_minor"], r["currency"], currency, date.fromisoformat(r["occurred_on"])) or 0
+            acc[r["category"]] = acc.get(r["category"], 0) + (v if r["type"] == "expense" else -v)
+        return sorted(((c, v) for c, v in acc.items() if v > 0), key=lambda x: -x[1])
 
-    def _payday_numbers(self) -> dict | None:
+    def _fx_warning(self) -> str:
+        if not self._fx_missing:
+            return ""
+        codes = ", ".join(sorted(self._fx_missing))
+        self._fx_missing.clear()
+        return (f"⚠️ Нет курса для {codes} — эти суммы не пересчитаны и не учтены. "
+                f"Курсы обновятся сами при доступе в интернет, или напишите «курс доллара 512 тенге».")
+
+    # wallet: separate balances per currency ("остаток 2400", "остаток 150000 тенге")
+    def _balances(self) -> dict[str, dict]:
+        raw = self.db.get_setting("balances")
+        if raw:
+            return json.loads(raw)
+        if self.db.get_setting("balance_minor") is not None:  # migrate the single-currency balance
+            return {self.currency: {"minor": int(self.db.get_setting("balance_minor")),
+                                    "after_tx": int(self.db.get_setting("balance_after_tx", "0")),
+                                    "after_move": 0, "set_at": self.db.get_setting("balance_set_at")}}
+        return {}
+
+    def _set_balance(self, currency: str, minor: int | None) -> None:
+        bal = self._balances()
+        if minor is None:
+            bal.pop(currency, None)
+        else:
+            bal[currency] = {"minor": minor,
+                             "after_tx": int(self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM transactions")),
+                             "after_move": int(self.db.scalar("SELECT COALESCE(MAX(id), 0) FROM moves")),
+                             "set_at": fmt_utc(self.now_utc())}
+        self.db.set_setting("balances", json.dumps(bal))
+        for k in ("balance_minor", "balance_set_at", "balance_after_tx"):
+            self.db.del_setting(k)
+
+    def _pockets(self) -> dict[str, tuple[int, int, datetime]]:
+        """{currency: (entered, calculated, set_at)} - calculated = entered ± everything recorded after it."""
+        out = {}
+        for cur, b in self._balances().items():
+            delta = int(self.db.scalar(
+                "SELECT COALESCE(SUM(CASE WHEN type IN ('income','refund') THEN amount_minor "
+                "WHEN type = 'expense' THEN -amount_minor ELSE 0 END), 0) FROM transactions "
+                "WHERE id > ? AND currency = ?", (b["after_tx"], cur)))
+            delta -= int(self.db.scalar(
+                "SELECT COALESCE(SUM(from_minor), 0) FROM moves WHERE id > ? AND from_currency = ? "
+                "AND kind IN ('exchange','deposit')", (b["after_move"], cur)))
+            delta += int(self.db.scalar(
+                "SELECT COALESCE(SUM(to_minor), 0) FROM moves WHERE id > ? AND to_currency = ? "
+                "AND kind IN ('exchange','withdraw')", (b["after_move"], cur)))
+            set_at = parse_utc(b["set_at"]).replace(tzinfo=None) if b.get("set_at") else self.now_utc()
+            out[cur] = (b["minor"], b["minor"] + delta, set_at)
+        return out
+
+    def _calculated_balance(self, currency: str | None = None) -> tuple[int, int, datetime] | None:
+        pockets = self._pockets()
+        if not pockets:
+            return None
+        cur = currency or self.report_currency
+        base = sum(self._conv(v[0], c, cur) or 0 for c, v in pockets.items())
+        calc = sum(self._conv(v[1], c, cur) or 0 for c, v in pockets.items())
+        return base, calc, max(v[2] for v in pockets.values())
+
+    def _payday_numbers(self, currency: str | None = None) -> dict | None:
         """Money-until-payday figures, or None when neither balance nor payday is configured."""
+        cur = currency or self.report_currency
         today = self.today()
         payday = self._payday_date()
-        bal = self._calculated_balance()
+        bal = self._calculated_balance(cur)
         if payday is None and bal is None:
             return None
         res: dict = {"payday": payday, "balance": bal, "mandatory": 0, "reserves": 0,
                      "available": None, "per_day": None, "days": None}
-        res["reserves"] = int(self.db.scalar("SELECT COALESCE(SUM(amount_minor), 0) FROM reserves"))
+        res["reserves"] = self._conv(int(self.db.scalar("SELECT COALESCE(SUM(amount_minor), 0) FROM reserves")),
+                                     self.currency, cur) or 0
         if payday is not None:
             days = (payday - today).days
             res["days"] = days
-            for p in self.db.all("SELECT * FROM payments WHERE currency = ?", (self.currency,)):
+            for p in self.db.all("SELECT * FROM payments"):
                 d = next_month_day(today, p["day_of_month"])
                 while d < payday or (days == 0 and d == payday):
                     if p["last_paid_month"] != d.strftime("%Y-%m"):
-                        res["mandatory"] += p["amount_minor"]
+                        res["mandatory"] += self._conv(p["amount_minor"], p["currency"], cur) or 0
                     d = add_months(d.replace(day=1), 1, p["day_of_month"])
             if bal is not None:
                 res["available"] = bal[1] - res["mandatory"] - res["reserves"]
@@ -1295,10 +1391,10 @@ class Service:
                     res["per_day"] = a // days if a > 0 else a
         return res
 
-    def payday_block(self) -> list[str]:
-        cur = self.currency
+    def payday_block(self, currency: str | None = None) -> list[str]:
+        cur = currency or self.report_currency
         today = self.today()
-        n = self._payday_numbers()
+        n = self._payday_numbers(cur)
         if n is None:
             return ["Не настроено. Напишите «остаток 2400» и «день зарплаты 25»."]
         lines = []
@@ -1308,12 +1404,15 @@ class Service:
             head = f"Зарплата: {fmt.day(payday, today)}" + (f", через {fmt.plural_days(days)}" if days > 0 else "")
             salary = self.db.get_setting("salary_amount")
             if salary:
-                head += f" (~{fmt.money(int(salary), cur)})"
+                head += f" (~{fmt.money(self._conv(int(salary), self.currency, cur) or 0, cur)})"
             lines.append(head)
         if bal is not None:
             base, calc, set_at = bal
+            pockets = self._pockets()
             lines.append(f"Введённый остаток: {fmt.money(base, cur)} ({fmt.day(self.to_local(set_at).date(), today)})")
             lines.append(f"Расчётный остаток: {fmt.money(calc, cur)} (по записям в боте, не банк)")
+            if len(pockets) > 1 or (pockets and next(iter(pockets)) != cur):
+                lines.append("  " + " · ".join(fmt.money(v[1], c) for c, v in pockets.items()))
         if payday is None:
             lines.append("День зарплаты не указан — напишите «день зарплаты 25».")
             return lines
@@ -1440,8 +1539,12 @@ class Service:
             [("✖️ Отменить задачу", f"t:s:{tid}:c"), ("🗑 Удалить", f"t:x:{tid}")],
         ], edit=True)
 
-    def view_money(self) -> Reply:
-        cur = self.currency
+    def _currency_row(self, prefix: str, current: str) -> list[tuple[str, str]]:
+        return [(("• " if c == current else "") + c, f"{prefix}{c}") for c in self.tracked_currencies]
+
+    def view_money(self, currency: str | None = None) -> Reply:
+        cur = currency or self.report_currency
+        e = html.escape
         today = self.today()
         week_start = today - timedelta(days=today.weekday())
         month_start = today.replace(day=1)
@@ -1449,43 +1552,41 @@ class Service:
         spent_week = self._net_expense(week_start, today, cur)
         spent_month = self._net_expense(month_start, today, cur)
         income_month = self._sum(("income",), month_start, today, cur)
-        lines = [f"💰 Деньги · {fmt.MONTHS_NOM[today.month - 1]} {today.year}",
-                 f"Сегодня: {fmt.money(spent_today, cur)}",
-                 f"Неделя: {fmt.money(spent_week, cur)}"]
+        lines = [f"💰 <b>Деньги · {fmt.MONTHS_NOM[today.month - 1]} {today.year}</b> · {cur}", "",
+                 f"Сегодня  <b>{fmt.money(spent_today, cur)}</b>",
+                 f"Неделя  <b>{fmt.money(spent_week, cur)}</b>"]
         budget = self.db.get_setting("monthly_budget")
-        month_line = f"Месяц: {fmt.money(spent_month, cur)}"
+        month_line = f"Месяц  <b>{fmt.money(spent_month, cur)}</b>"
         if budget:
-            b = int(budget)
+            b = self._conv(int(budget), self.currency, cur) or 0
             month_line += f" из {fmt.money(b, cur)} ({spent_month * 100 // b if b else 0}%)"
         lines.append(month_line)
-        lines.append(f"Доходы за месяц: {fmt.money(income_month, cur, '+')}")
-        cats = self.db.all(
-            "SELECT category, SUM(CASE WHEN type = 'expense' THEN amount_minor ELSE -amount_minor END) AS s "
-            "FROM transactions WHERE type IN ('expense','refund') AND occurred_on BETWEEN ? AND ? AND currency = ? "
-            "GROUP BY category HAVING s > 0 ORDER BY s DESC", (month_start.isoformat(), today.isoformat(), cur))
-        limits = {r["category"]: r["amount_minor"] for r in self.db.all("SELECT * FROM category_limits")}
+        lines.append(f"Доходы за месяц  <b>{fmt.money(income_month, cur, '+')}</b>")
+        cats = self._by_category(month_start, today, cur)
+        limits = {r["category"]: self._conv(r["amount_minor"], self.currency, cur)
+                  for r in self.db.all("SELECT * FROM category_limits")}
         if cats:
-            lines.append("\nПо категориям (месяц):")
-            for r in cats:
-                pct = r["s"] * 100 // spent_month if spent_month > 0 else 0
-                lim = limits.get(r["category"])
-                lim_s = f" / лимит {fmt.money(lim)}{' ⚠️' if r['s'] > lim else ''}" if lim else ""
-                lines.append(f"• {r['category']} — {fmt.money(r['s'])} ({pct}%){lim_s}")
-        other = self.db.all("SELECT currency, SUM(amount_minor) AS s FROM transactions WHERE type = 'expense' AND "
-                            "occurred_on BETWEEN ? AND ? AND currency != ? GROUP BY currency",
-                            (month_start.isoformat(), today.isoformat(), cur))
-        if other:
-            lines.append("Другие валюты: " + ", ".join(fmt.money(r["s"], r["currency"]) for r in other))
-        lines.append("\n🗓 До зарплаты:")
-        lines += self.payday_block()
+            lines += ["", "<b>По категориям</b>"]
+            for name, v in cats:
+                pct = v * 100 // spent_month if spent_month > 0 else 0
+                lim = limits.get(name)
+                lim_s = f" · лимит {fmt.money(lim)}{' ⚠️' if v > lim else ''}" if lim else ""
+                lines.append(f"• {e(name)} — {fmt.money(v)} ({pct}%){lim_s}")
+        lines += ["", "🗓 <b>До зарплаты</b>"]
+        lines += [e(x) for x in self.payday_block(cur)]
         recent = self.db.all("SELECT * FROM transactions ORDER BY occurred_on DESC, id DESC LIMIT 7")
         if recent:
-            lines.append("\nПоследние:")
+            lines += ["", "<b>Последние</b>"]
             for r in recent:
                 d = date.fromisoformat(r["occurred_on"])
-                lines.append(f"{d.strftime('%d.%m')} {self._tx_line(dict(r), show_date=False)}")
-        buttons = [[("📊 Аналитика", "st:m"), ("Последние 20", "money:recent")], [("Настройки денег", "money:help")]]
-        return Reply("\n".join(lines), buttons)
+                lines.append(f"{d.strftime('%d.%m')}  {e(self._tx_line(dict(r), show_date=False))}")
+        warn = self._fx_warning()
+        if warn:
+            lines += ["", e(warn)]
+        buttons = [[("📊 Аналитика", f"st:m:{cur}"), ("💼 Капитал", f"cap:{cur}"), ("💱 Курсы", "fx:v")],
+                   self._currency_row("money:c:", cur),
+                   [("Последние 20", "money:recent"), ("Как настроить", "money:help")]]
+        return Reply("\n".join(lines), buttons, html=True)
 
     def view_recent_tx(self) -> Reply:
         rows = self.db.all("SELECT * FROM transactions ORDER BY occurred_on DESC, id DESC LIMIT 20")
@@ -1564,7 +1665,7 @@ class Service:
         onoff = {"1": "вкл", "0": "выкл"}
         budget = g("monthly_budget")
         salary = g("salary_amount")
-        bal = g("balance_minor")
+        bal = " · ".join(fmt.money(v[1], c) for c, v in self._pockets().items())
         lines = [
             "⚙️ Настройки",
             f"Валюта: {cur}",
@@ -1576,7 +1677,8 @@ class Service:
             f"Бюджет месяца: {fmt.money(int(budget), cur) if budget else '—'}",
             f"День зарплаты: {g('payday_day') or '—'}",
             f"Ожидаемая зарплата: {fmt.money(int(salary), cur) if salary else '—'}",
-            f"Введённый остаток: {fmt.money(int(bal), cur) if bal else '—'}",
+            f"Валюта отчётов: {self.report_currency} (переключение — кнопками в отчётах)",
+            f"Остаток (расчётный): {bal or '—'}",
             f"Отчёт-картинка за месяц 1-го числа: {onoff[g('monthly_report')]}",
             "AI: " + (f"{onoff[g('ai_enabled')]} ({self.ai.cfg.provider}, {self.ai.cfg.model})" if self.ai is not None
                       else "не подключён (см. README)"),
@@ -1630,6 +1732,49 @@ class Service:
     # ------------------------------------------------------------ analytics (images)
     PERIODS = {"w": "Неделя", "m": "Месяц", "pm": "Прошлый месяц", "6": "Полгода"}
 
+    def _period_range(self, period: str) -> tuple[date, date, str]:
+        today = self.today()
+        if period == "w":
+            return today - timedelta(days=today.weekday()), today, "эта неделя"
+        if period == "6":
+            return add_months(today.replace(day=1), -5), today, "полгода"
+        if period == "pm":
+            end = today.replace(day=1) - timedelta(days=1)
+            return end.replace(day=1), end, fmt.MONTHS_NOM[end.month - 1]
+        return today.replace(day=1), today, fmt.MONTHS_NOM[today.month - 1]
+
+    def category_drill(self, period: str, cur: str, idx: int | None = None) -> Reply:
+        """Tap-through from the report: list of categories -> one category's operations."""
+        e = html.escape
+        start, end, label = self._period_range(period)
+        cats = self._by_category(start, end, cur)
+        total = sum(v for _, v in cats) or 1
+        if idx is None:
+            rows = [[(f"{name} · {fmt.money(v)} · {v * 100 // total}%", f"sc:{period}:{cur}:{CATEGORIES.index(name)}")]
+                    for name, v in cats[:12]]
+            rows.append([("◀ К отчёту", f"st:{period}:{cur}")])
+            return Reply(f"🔎 <b>Категории · {e(label)}</b> · {cur}\nНажмите, чтобы увидеть операции.", rows, html=True)
+        name = CATEGORIES[idx]
+        txs = self._tx_rows(("expense", "refund"), start, end, name)
+        conv = sorted(((r, self._conv(r["amount_minor"], r["currency"], cur, date.fromisoformat(r["occurred_on"])) or 0)
+                       for r in txs), key=lambda x: (x[0]["occurred_on"], x[0]["id"]), reverse=True)
+        amount = sum(v if r["type"] == "expense" else -v for r, v in conv)
+        n = sum(1 for r, _ in conv if r["type"] == "expense")
+        lines = [f"<b>{e(name)}</b> · {e(label)}", f"<b>{fmt.money(amount, cur)}</b> · {n} {fmt.plural(n, 'операция', 'операции', 'операций')} · "
+                 f"{amount * 100 // total}% расходов", ""]
+        prev_day = None
+        for r, v in conv[:40]:
+            if r["occurred_on"] != prev_day:
+                prev_day = r["occurred_on"]
+                lines.append(f"<i>{fmt.cap(fmt.day(date.fromisoformat(prev_day), self.today()))}</i>")
+            sign = "−" if r["type"] == "expense" else "↩ +"
+            orig = f" ({fmt.money(r['amount_minor'], r['currency'])})" if r["currency"] != cur else ""
+            lines.append(f"  {sign}{fmt.money(v)}{orig} · {e(r['description'] or name)}")
+        if len(conv) > 40:
+            lines.append(f"…и ещё {len(conv) - 40}")
+        return Reply("\n".join(lines), [[("◀ Категории", f"sc:{period}:{cur}"), ("◀ К отчёту", f"st:{period}:{cur}")]],
+                     html=True)
+
     def _category_colors(self, ranked: list[str]) -> dict[str, int]:
         """Permanent category -> palette slot. New categories take the next free slot (max 8)."""
         colors: dict[str, int] = json.loads(self.db.get_setting("category_colors", "{}"))
@@ -1644,11 +1789,11 @@ class Service:
             self.db.set_setting("category_colors", json.dumps(colors, ensure_ascii=False))
         return colors
 
-    def analytics(self, period: str = "m") -> Reply:
+    def analytics(self, period: str = "m", currency: str | None = None) -> Reply:
         from . import charts
 
         today = self.today()
-        cur = self.currency
+        cur = currency or self.report_currency
         limits = {r["category"]: r["amount_minor"] for r in self.db.all("SELECT * FROM category_limits")}
         month_names_gen = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
                            "сентября", "октября", "ноября", "декабря"]
@@ -1699,17 +1844,14 @@ class Service:
             bars_title = "По дням"
             budget = self.db.get_setting("monthly_budget")
             if budget:
-                reference = ("бюджет/день", int(budget) // month_end.day)
+                reference = ("бюджет/день", (self._conv(int(budget), self.currency, cur) or 0) // month_end.day)
         total = self._net_expense(start, end, cur)
         compare_total = self._net_expense(prev_start, prev_end, cur) if prev_start else None
         income = self._sum(("income",), start, end, cur)
-        rows = self.db.all(
-            "SELECT category, SUM(CASE WHEN type = 'expense' THEN amount_minor ELSE -amount_minor END) AS s "
-            "FROM transactions WHERE type IN ('expense','refund') AND occurred_on BETWEEN ? AND ? AND currency = ? "
-            "GROUP BY category HAVING s > 0 ORDER BY s DESC", (start.isoformat(), end.isoformat(), cur))
         monthly_view = period in ("m", "pm")
-        categories = [charts.CategoryRow(r["category"], r["s"], limits.get(r["category"]) if monthly_view else None)
-                      for r in rows]
+        categories = [charts.CategoryRow(name, v, (self._conv(limits[name], self.currency, cur)
+                                                   if monthly_view and name in limits else None))
+                      for name, v in self._by_category(start, end, cur)]
         days = (end - start).days + 1
         whole = lambda m: fmt.money(round(m / 100) * 100)  # noqa: E731 - tiles show whole units
         kpis = [("Доходы", "+" + whole(income) if income else "0")]
@@ -1725,10 +1867,10 @@ class Service:
             n_tx = self.db.scalar("SELECT COUNT(*) FROM transactions WHERE type = 'expense' AND occurred_on "
                                   "BETWEEN ? AND ?", (start.isoformat(), end.isoformat()))
             kpis.append(("Покупок", str(n_tx)))
-        top = [(date.fromisoformat(r["occurred_on"]).strftime("%d.%m"), r["description"] or r["category"],
-                r["amount_minor"]) for r in self.db.all(
-            "SELECT * FROM transactions WHERE type = 'expense' AND currency = ? AND occurred_on BETWEEN ? AND ? "
-            "ORDER BY amount_minor DESC LIMIT 3", (cur, start.isoformat(), end.isoformat()))]
+        conv_rows = [(r, self._conv(r["amount_minor"], r["currency"], cur, date.fromisoformat(r["occurred_on"])) or 0)
+                     for r in self._tx_rows(("expense",), start, end)]
+        top = [(date.fromisoformat(r["occurred_on"]).strftime("%d.%m"), r["description"] or r["category"], v)
+               for r, v in sorted(conv_rows, key=lambda x: -x[1])[:3]]
         rep = charts.Report(colors=self._category_colors([r.name for r in categories]), title=title, subtitle=subtitle, currency=cur, total=total, compare_label=compare_label,
                             compare_total=compare_total, income=income, kpis=kpis, categories=categories,
                             bars=bars, bars_title=bars_title, bar_reference=reference, top=top)
@@ -1739,7 +1881,13 @@ class Service:
             pct = round((total - compare_total) * 100 / compare_total)
             lines[0] += f" ({'+' if pct > 0 else ''}{pct}% {compare_label})"
         lines += [f"{r.name} — {fmt.money(r.amount)} ({r.amount * 100 // max(total, 1)}%)" for r in categories[:5]]
-        buttons = [[(("• " if k == period else "") + v, f"st:{k}") for k, v in self.PERIODS.items()]]
+        warn = self._fx_warning()
+        if warn:
+            lines.append(warn)
+        buttons = [[(("• " if k == period else "") + v, f"st:{k}:{cur}") for k, v in self.PERIODS.items()],
+                   self._currency_row(f"st:{period}:", cur)]
+        if categories:
+            buttons.append([("🔎 По категориям", f"sc:{period}:{cur}")])
         return Reply("\n".join(lines), buttons, photo=(f"report-{period}-{today.isoformat()}.png", png))
 
     # ------------------------------------------------------------ export
@@ -1794,8 +1942,22 @@ class Service:
                 return self._cb_choice(parts[1], parts[2])
             if head == "set":
                 return self._cb_settings(parts)
+            if head == "cap":
+                return self._cb_capital(parts)
+            if head == "acc":
+                if parts[1] == "x":
+                    return self.delete_account(int(parts[2]))
+                r = self.account_card(int(parts[1]), parts[2] if len(parts) > 2 else None)
+                r.edit = True
+                return r
+            if head == "fx":
+                if parts[1] == "v":
+                    return self.view_rates()
+                return self._cb_fx(parts)
+            if head == "sc":
+                return self.category_drill(parts[1], parts[2], int(parts[3]) if len(parts) > 3 else None)
             if head == "st":
-                r = self.analytics(parts[1])
+                r = self.analytics(parts[1], parts[2] if len(parts) > 2 else None)
                 r.edit = True
                 return r
             if head == "pay":
@@ -1803,6 +1965,12 @@ class Service:
             if head == "money":
                 if parts[1] == "recent":
                     return self.view_recent_tx()
+                if parts[1] == "c":
+                    with self.db.tx():
+                        self.db.set_setting("report_currency", parts[2])
+                    r = self.view_money(parts[2])
+                    r.edit = True
+                    return r
                 return Reply(self.MONEY_HELP)
             if head == "menu":
                 return {"today": self.view_today, "tasks": self.view_tasks, "money": self.view_money,
@@ -1811,6 +1979,23 @@ class Service:
             log.exception("callback %s failed", data)
             return Reply("⚠️ Не получилось выполнить действие. Изменения не сохранены.")
         return Reply("Кнопка устарела.", toast="Кнопка устарела")
+
+    def _cb_capital(self, parts: list[str]) -> Reply:
+        arg = parts[1] if len(parts) > 1 else ""
+        if arg == "help":
+            return Reply(CAPITAL_HELP, html=True)
+        if arg == "img":
+            return self.capital_image(parts[2] if len(parts) > 2 else None)
+        if arg == "ref":
+            res = self.refresh_market(force=True)
+            r = self.view_capital(parts[2] if len(parts) > 2 else None)
+            failed = res["prices_failed"]
+            r.toast = "Не удалось: " + ", ".join(failed) if failed else "Обновлено"
+            r.edit = True
+            return r
+        r = self.view_capital(arg or None)
+        r.edit = bool(arg)
+        return r
 
     def _cb_tx(self, parts: list[str]) -> Reply:
         op, tx_id = parts[1], int(parts[2])
@@ -1909,6 +2094,8 @@ class Service:
         elif kind == "date":
             chosen = date.fromisoformat(payload["dates"][int(opt)])
             r = self._process(payload["text"], payload.get("msg"), tomorrow_date=chosen)
+        elif kind == "rate":
+            r = self._set_manual_rate(payload["from"], opt, Decimal(payload["value"]))
         elif kind == "when":
             self._clear_pending()
             r = self._remind_from_choice(payload["title"], opt, payload.get("msg"))

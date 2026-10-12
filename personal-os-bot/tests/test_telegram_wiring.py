@@ -77,7 +77,7 @@ def test_full_flow(svc, tmp_path):
     assert "Personal OS" in sent[0].text
     assert sent[1].text.startswith("Записал: −18 AED")
     assert sent[1].reply_markup.inline_keyboard[0][0].text == "Отменить"
-    assert sent[2].text.startswith("💰 Деньги")
+    assert sent[2].text.startswith("💰 <b>Деньги") and sent[2].parse_mode == "HTML"
     assert all(c.chat_id == OWNER for c in sent)  # nothing went to the stranger
     edits = [c for c in session.calls if isinstance(c, EditMessageText)]
     assert edits and edits[0].text.startswith("↩️ Отменено")
@@ -96,4 +96,4 @@ def test_stats_sends_photo(svc, tmp_path):
     asyncio.run(go())
     photos = [c for c in session.calls if isinstance(c, SendPhoto)]
     assert len(photos) == 1 and photos[0].caption.startswith("📊")
-    assert photos[0].reply_markup.inline_keyboard[0][1].callback_data == "st:m"
+    assert photos[0].reply_markup.inline_keyboard[0][1].callback_data == "st:m:AED"

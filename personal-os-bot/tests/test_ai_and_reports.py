@@ -185,7 +185,9 @@ def test_report_images_render(svc, mid, period):
     fmt_, (w, h) = _png_size(r.photo[1])
     assert fmt_ == "PNG" and w == 1080 and h > 1000
     assert r.text.startswith("📊")
-    assert [d for row in r.buttons for _, d in row] == ["st:w", "st:m", "st:pm", "st:6"]
+    datas = [d for row in r.buttons for _, d in row]
+    assert datas[:4] == ["st:w:AED", "st:m:AED", "st:pm:AED", "st:6:AED"]
+    assert f"st:{period}:USD" in datas and f"st:{period}:KZT" in datas
 
 
 def test_report_empty_period_renders(svc):
@@ -218,4 +220,4 @@ def test_monthly_report_sent_on_first_day(svc, mid, clock):
 
 
 def test_money_view_links_to_analytics(svc):
-    assert any(d == "st:m" for row in svc.view_money().buttons for _, d in row)
+    assert any(d == "st:m:AED" for row in svc.view_money().buttons for _, d in row)

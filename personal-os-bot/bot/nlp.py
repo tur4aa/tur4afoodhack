@@ -80,8 +80,8 @@ CURRENCY_PATTERNS: list[tuple[str, str]] = [
     ("GBP", r"gbp|£|фунт\w*|pounds?"),
     ("KZT", r"kzt|₸|тенге|тг\.?"),
 ]
-CURRENCY_RE = re.compile(
-    r"(?<!\w)(?:" + "|".join(f"(?P<{code}>{p})" for code, p in CURRENCY_PATTERNS) + r")(?!\w)", F
+CURRENCY_RE = re.compile(  # may stick to a number ("110$", "18aed") but not to a letter
+    r"(?<![^\W\d_])(?:" + "|".join(f"(?P<{code}>{p})" for code, p in CURRENCY_PATTERNS) + r")(?!\w)", F
 )
 
 AMOUNT_RE = re.compile(
@@ -453,6 +453,11 @@ def _money_intent(raw: str, ti: TimeInfo, amounts: list[Amount], now: datetime, 
         item = build_money_item(ti.remaining, amounts[0], ti, currency, today, memory)
         words = [w for w in re.findall(r"[^\W\d]+", item.description, F) if w.lower() not in STOPWORDS]
         return Intent("money", raw, items=[item], time=ti, low_confidence=len(words) > 5)
+    # «купил 2 батарейки за 10» - the number after «за/for» is the price
+    priced = [a for a in amounts if re.search(r"(?:\bза|\bfor|\bпо)\s*$", ti.remaining[:a.start], F)]
+    if len(priced) == 1:
+        return Intent("money", raw, items=[build_money_item(ti.remaining, priced[0], ti, currency, today, memory)],
+                      time=ti)
     return Intent("ask_amount", raw, time=ti, candidates=[a.value for a in amounts])
 
 

@@ -53,3 +53,10 @@ class Msg:
 @pytest.fixture
 def mid():
     return Msg()
+
+
+def plain(text: str) -> str:
+    """Telegram HTML -> plain text with single spaces, for assertions."""
+    import html as _h
+    import re as _re
+    return _re.sub(r"[ \t]+", " ", _h.unescape(_re.sub(r"<[^>]+>", "", text)))

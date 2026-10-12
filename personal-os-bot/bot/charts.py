@@ -325,3 +325,163 @@ def _nice_step(raw: float) -> float:
 
 def day_label(d: date) -> str:
     return str(d.day)
+
+
+# ------------------------------------------------------------------ capital card
+
+
+@dataclass
+class CapitalReport:
+    currency: str
+    total: int
+    change: tuple[int, str] | None            # (diff minor, since day ISO)
+    wallet: int
+    invested: int
+    capital: int
+    parts: list[tuple[str, str, int]]          # (name, kind label, value minor)
+    colors: dict[str, int]
+    history: list[tuple[str, int]]             # (day ISO, value minor)
+    holdings: list[tuple[str, str, int, float | None]]   # (symbol, qty, value minor, pnl %)
+    footer: str = "Personal OS · оценка по последним известным ценам и курсам"
+
+
+def _line_chart(c: Canvas, x0, y0, x1, y1, points: list[tuple[str, int]], cur: str) -> None:
+    vals = [v for _, v in points]
+    lo, hi = min(vals), max(vals)
+    min_span = max(abs(hi) * 0.04, 3000)   # flat history should look flat, not like a crash
+    if hi - lo < min_span:
+        mid = (hi + lo) / 2
+        lo, hi = mid - min_span / 2, mid + min_span / 2
+    pad = (hi - lo) * 0.12
+    lo, hi = lo - pad, hi + pad
+    px0, px1, py0, py1 = x0 + 96, x1, y0, y1 - 40
+    step = (hi - lo) / 3
+    labels = [compact(int(lo + step * k)) for k in range(4)]
+    if len(set(labels)) < 4:   # narrow range: compact labels would repeat ("19K, 19K") - show full numbers
+        labels = [fmt.money(round((lo + step * k) / 100) * 100) for k in range(4)]
+    for k in range(4):
+        ty = py1 - (py1 - py0) * k / 3
+        c.line(px0, ty, px1, ty, GRID if k else BASE, 1)
+        c.text(px0 - 14, ty - 11, labels[k], 18, 400, MUTED, anchor="ra")
+    n = len(points)
+
+    def xy(i, v):
+        return px0 + (px1 - px0) * (i / max(n - 1, 1)), py1 - (py1 - py0) * (v - lo) / (hi - lo)
+
+    pts = [xy(i, v) for i, (_, v) in enumerate(points)]
+    # area wash
+    poly = [(px * S, py * S) for px, py in pts] + [(pts[-1][0] * S, py1 * S), (pts[0][0] * S, py1 * S)]
+    overlay = Image.new("RGBA", c.img.size, (0, 0, 0, 0))
+    ImageDraw.Draw(overlay).polygon(poly, fill=hex_rgb(ACCENT) + (26,))
+    c.img.paste(overlay, (0, 0), overlay)
+    c.d = ImageDraw.Draw(c.img)
+    c.d.line([(px * S, py * S) for px, py in pts], fill=ACCENT, width=2 * S, joint="curve")
+    ex, ey = pts[-1]
+    c.circle(ex, ey, 7, CARD)
+    c.circle(ex, ey, 5, ACCENT)
+    first, last = points[0][0], points[-1][0]
+    c.text(px0, py1 + 14, f"{int(first[8:])}.{first[5:7]}", 18, 400, MUTED)
+    c.text(px1, py1 + 14, f"{int(last[8:])}.{last[5:7]}", 18, 600, INK, anchor="ra")
+
+
+def render_capital(rep: CapitalReport) -> bytes:
+    cur = rep.currency
+    parts = sorted(rep.parts, key=lambda p: -p[2])
+    n_parts = min(len(parts), 7)
+    has_hold = bool(rep.holdings)
+    height = (PAD + 300 + 24 + 150 + 24 + (110 + max(n_parts, 1) * 78 + 40) + 24 + 400
+              + (24 + 100 + 64 * len(rep.holdings) if has_hold else 0) + 90)
+    c = Canvas(height)
+    x0, x1 = PAD, W - PAD
+    y = PAD
+
+    c.rect(x0, y, x1, y + 300, CARD, 28)
+    c.text(x0 + 40, y + 40, "Капитал", 30, 700)
+    c.text(x0 + 40, y + 84, "счета, инвестиции, имущество и кошелёк", 22, 400, INK2)
+    c.text(x0 + 40, y + 132, fmt.money(rep.total), 84, 700)
+    tw = c.width(fmt.money(rep.total), 84, 700)
+    c.text(x0 + 52 + tw, y + 176, cur, 32, 500, INK2)
+    if rep.change:
+        diff, since = rep.change
+        base = rep.total - diff
+        pct = diff * 100 / base if base else 0
+        up = diff >= 0
+        chip = f"{'▲' if up else '▼'} {abs(pct):.1f}%"
+        cw = c.width(chip, 22, 600) + 32
+        c.rect(x0 + 40, y + 236, x0 + 40 + cw, y + 274, _tint(GOOD if up else CRITICAL), 19)
+        c.text(x0 + 56, y + 242, chip, 22, 600, INK)
+        c.text(x0 + 56 + cw, y + 242, f"{'+' if up else '−'}{fmt.money(abs(diff))} с {int(since[8:])}.{since[5:7]}",
+               22, 400, INK2)
+    y += 324
+
+    pnl = rep.capital - rep.invested
+    kpis = [("Вложено", fmt.money(round(rep.invested / 100) * 100)),
+            ("Результат", ("+" if pnl >= 0 else "−") + fmt.money(round(abs(pnl) / 100) * 100)),
+            ("Кошелёк", fmt.money(round(rep.wallet / 100) * 100))]
+    kw = (x1 - x0 - 40) / 3
+    for i, (label, value) in enumerate(kpis):
+        kx = x0 + i * (kw + 20)
+        c.rect(kx, y, kx + kw, y + 150, CARD, 24)
+        c.text(kx + 28, y + 30, label, 20, 400, MUTED)
+        c.text(kx + 28, y + 70, _fit(c, value, 36, 700, kw - 56), 36, 700)
+    y += 174
+
+    block_h = 110 + max(n_parts, 1) * 78 + 40
+    c.rect(x0, y, x1, y + block_h, CARD, 28)
+    c.text(x0 + 40, y + 40, "Где деньги", 28, 700)
+    total = sum(p[2] for p in parts) or 1
+    if parts:
+        slot = lambda name: SERIES[rep.colors[name]] if name in rep.colors else OTHER  # noqa: E731
+        donut_parts = sorted(parts[:6], key=lambda p: rep.colors.get(p[0], 99))
+        rest = total - sum(p[2] for p in donut_parts)
+        segs = [(slot(p[0]), p[2]) for p in donut_parts] + ([(OTHER, rest)] if rest > 0 else [])
+        r_out = min(150, (block_h - 150) / 2)
+        cx, cy = x1 - 40 - r_out, y + 110 + r_out
+        _donut(c, cx, cy, r_out, r_out * 0.66, segs)
+        top_share = parts[0][2] * 100 / total
+        c.text(cx, cy - 6, f"{top_share:.0f}%", 40, 700, INK, anchor="ms")
+        c.text(cx, cy + 30, _fit(c, parts[0][0], 18, 400, r_out * 1.1), 18, 400, MUTED, anchor="ms")
+        list_x1 = cx - r_out - 48
+        ly = y + 110
+        for name, label, v in parts[:n_parts]:
+            c.circle(x0 + 50, ly + 14, 8, slot(name))
+            right = fmt.money(v)
+            rw = c.width(right, 24, 600)
+            c.text(list_x1, ly, right, 24, 600, INK, anchor="ra")
+            c.text(x0 + 72, ly, _fit(c, name, 24, 500, list_x1 - x0 - 72 - rw - 80), 24, 500, INK)
+            c.text(list_x1 - rw - 16, ly + 2, f"{v * 100 / total:.0f}%", 20, 400, MUTED, anchor="ra")
+            c.text(x0 + 72, ly + 36, label, 18, 400, MUTED)
+            ly += 78
+    else:
+        c.text(x0 + 40, y + 110, "Счетов пока нет", 24, 400, INK2)
+    y += block_h + 24
+
+    c.rect(x0, y, x1, y + 400, CARD, 28)
+    c.text(x0 + 40, y + 40, "Динамика", 28, 700)
+    if len(rep.history) >= 2:
+        _line_chart(c, x0 + 40, y + 110, x1 - 40, y + 380, rep.history, cur)
+    else:
+        c.text(x0 + 40, y + 120, "График появится через пару дней —", 24, 400, INK2)
+        c.text(x0 + 40, y + 158, "бот сохраняет стоимость капитала раз в день.", 24, 400, INK2)
+    y += 424
+
+    if has_hold:
+        th = 100 + 64 * len(rep.holdings)
+        c.rect(x0, y, x1, y + th, CARD, 28)
+        c.text(x0 + 40, y + 40, "Позиции", 28, 700)
+        ty = y + 104
+        for sym, qty, value, pct in rep.holdings:
+            c.text(x0 + 40, ty, sym, 24, 600, INK)
+            c.text(x0 + 180, ty + 2, qty, 22, 400, MUTED)
+            c.text(x1 - 200, ty, fmt.money(value), 24, 600, INK, anchor="ra")
+            if pct is not None:
+                up = pct >= 0
+                chip = f"{'▲' if up else '▼'} {abs(pct):.1f}%"
+                cw = c.width(chip, 20, 600) + 24
+                c.rect(x1 - 40 - cw, ty - 4, x1 - 40, ty + 30, _tint(GOOD if up else CRITICAL), 17)
+                c.text(x1 - 40 - cw / 2, ty, chip, 20, 600, INK, anchor="ma")
+            ty += 64
+        y += th + 24
+
+    c.text(W / 2, y + 16, rep.footer, 18, 400, MUTED, anchor="ma")
+    return c.png()
